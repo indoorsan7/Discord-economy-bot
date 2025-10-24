@@ -27,7 +27,7 @@ function getBalance(userId) {
     return userBalance.get(userId) || 0;
 }
 
-function updateBalance(userId, amount) {
+function updateBalance(userId, amount) {    
     userBalance.set(userId, amount);
 }
 
@@ -198,8 +198,19 @@ client.on('interactionCreate', async interaction => {
                 await handleRob(interaction, userId, currentBalance);
                 break;
             case 'balance':
+                const balanceEmbed = new EmbedBuilder()
+                    .setColor(0x00BFFF)
+                    .setTitle('💸 現在の残高')
+                    .setDescription(`あなたの現在の残高は以下の通りです。`)
+                    .addFields({ 
+                        name: '残高', 
+                        value: `**${currentBalance.toLocaleString()}** コイン`, 
+                        inline: true 
+                    })
+                    .setTimestamp();
+
                 await interaction.reply({ 
-                    content: `あなたの現在の残高は **${currentBalance.toLocaleString()}** コインです。`,
+                    embeds: [balanceEmbed],
                     ephemeral: true
                 });
                 break;
@@ -216,14 +227,25 @@ client.on('interactionCreate', async interaction => {
                 await handleGive(interaction, userId, currentBalance);
                 break;
             default:
-                await interaction.reply({ content: '不明なエコノミーコマンドです。', ephemeral: true });
+                const unknownEmbed = new EmbedBuilder()
+                    .setColor(0xFF0000)
+                    .setTitle('❌ エラー')
+                    .setDescription('不明なエコノミーコマンドです。')
+                    .setTimestamp();
+                await interaction.reply({ embeds: [unknownEmbed], ephemeral: true });
         }
     } catch (error) {
         console.error('コマンド実行中にエラーが発生しました:', error);
+        const errorEmbed = new EmbedBuilder()
+            .setColor(0xFF0000)
+            .setTitle('⚠️ 予期せぬエラー')
+            .setDescription('コマンド実行中に予期せぬエラーが発生しました。時間を置いて再度お試しください。')
+            .setTimestamp();
+            
         if (!interaction.replied && !interaction.deferred) {
-            await interaction.reply({ content: 'コマンド実行中に予期せぬエラーが発生しました。', ephemeral: true });
+            await interaction.reply({ embeds: [errorEmbed], ephemeral: true });
         } else if (interaction.deferred) {
-             await interaction.editReply({ content: 'コマンド実行中に予期せぬエラーが発生しました。' });
+             await interaction.editReply({ embeds: [errorEmbed] });
         }
     }
 });
@@ -237,8 +259,14 @@ async function handleWork(interaction, userId, currentBalance) {
         const remaining = lastWork + COOLDOWN_WORK_MS - now;
         const timeRemaining = formatCooldown(remaining);
 
+        const cooldownEmbed = new EmbedBuilder()
+            .setColor(0xFF8C00)
+            .setTitle('⏳ クールタイム中')
+            .setDescription(`まだ疲れています。**${timeRemaining}** 後にまた仕事ができます。`)
+            .setTimestamp();
+
         return interaction.reply({ 
-            content: `まだ疲れています。**${timeRemaining}** 後にまた仕事ができます。`, 
+            embeds: [cooldownEmbed], 
             ephemeral: true 
         });
     }
@@ -250,26 +278,35 @@ async function handleWork(interaction, userId, currentBalance) {
 
     userCooldowns.set(userId, { ...cooldownData, work: now });
 
-    await interaction.reply({
-        content: `💼 お疲れ様です！ **${earnedMoney.toLocaleString()}** コイン稼ぎました。\n現在の残高: **${newBalance.toLocaleString()}** コイン`
-    });
+    const successEmbed = new EmbedBuilder()
+        .setColor(0x00FF00)
+        .setTitle('💼 仕事完了')
+        .setDescription(`お疲れ様です！ **${earnedMoney.toLocaleString()}** コイン稼ぎました。`)
+        .addFields({ name: '現在の残高', value: `**${newBalance.toLocaleString()}** コイン`, inline: true })
+        .setTimestamp();
+
+    await interaction.reply({ embeds: [successEmbed] });
 }
 
 async function handleRob(interaction, userId, currentBalance) {
     const targetUser = interaction.options.getUser('target');
     const now = Date.now();
 
+    const errorEmbed = (description) => new EmbedBuilder().setColor(0xFF0000).setTitle('❌ 強盗失敗').setDescription(description).setTimestamp();
+    const warningEmbed = (description) => new EmbedBuilder().setColor(0xFFFF00).setTitle('⚠️ 強盗不可').setDescription(description).setTimestamp();
+
+
     if (targetUser.id === userId) {
-        return interaction.reply({ content: '自分自身を盗むことはできません！', ephemeral: true });
+        return interaction.reply({ embeds: [errorEmbed('自分自身を盗むことはできません！')], ephemeral: true });
     }
     if (targetUser.bot) {
-        return interaction.reply({ content: 'ボットからは盗めません。', ephemeral: true });
+        return interaction.reply({ embeds: [errorEmbed('ボットからは盗めません。')], ephemeral: true });
     }
 
     const targetBalance = getBalance(targetUser.id);
 
     if (targetBalance < 100) {
-        return interaction.reply({ content: `${targetUser.username} は貧しいようです。盗むには最低100コイン必要です。`, ephemeral: true });
+        return interaction.reply({ embeds: [warningEmbed(`${targetUser.username} は貧しいようです。盗むには最低100コイン必要です。`)], ephemeral: true });
     }
 
     const cooldownData = userCooldowns.get(userId) || {};
@@ -278,12 +315,19 @@ async function handleRob(interaction, userId, currentBalance) {
     if (now < lastRob + COOLDOWN_ROB_MS) {
         const remaining = lastRob + COOLDOWN_ROB_MS - now;
         const timeRemaining = formatCooldown(remaining);
-        return interaction.reply({ content: `まだ強盗のクールタイム中です。**${timeRemaining}** 待ってください。`, ephemeral: true });
+        
+        const cooldownEmbed = new EmbedBuilder()
+            .setColor(0xFF8C00)
+            .setTitle('⏳ クールタイム中')
+            .setDescription(`まだ強盗のクールタイム中です。**${timeRemaining}** 待ってください。`)
+            .setTimestamp();
+
+        return interaction.reply({ embeds: [cooldownEmbed], ephemeral: true });
     }
 
     const success = Math.random() < 0.5;
 
-    let replyMessage;
+    let resultEmbed;
     let newRobberBalance = currentBalance;
     let newTargetBalance = targetBalance;
 
@@ -297,7 +341,15 @@ async function handleRob(interaction, userId, currentBalance) {
         updateBalance(userId, newRobberBalance);
         updateBalance(targetUser.id, newTargetBalance);
 
-        replyMessage = `🚨 **成功！** ${targetUser.username} から **${stolenAmount.toLocaleString()}** コインを盗みました！\nあなたの残高: **${newRobberBalance.toLocaleString()}** コイン`;
+        resultEmbed = new EmbedBuilder()
+            .setColor(0x00FF00)
+            .setTitle('🚨 強盗成功！')
+            .setDescription(`${targetUser.username} から **${stolenAmount.toLocaleString()}** コインを盗みました！`)
+            .addFields(
+                { name: 'あなたの残高', value: `**${newRobberBalance.toLocaleString()}** コイン`, inline: true },
+                { name: `${targetUser.username} の残高`, value: `**${newTargetBalance.toLocaleString()}** コイン`, inline: true }
+            )
+            .setTimestamp();
 
     } else {
         const lossPercentage = Math.random() * (0.70 - 0.60) + 0.60;
@@ -306,22 +358,32 @@ async function handleRob(interaction, userId, currentBalance) {
         newRobberBalance = Math.max(0, currentBalance - lossAmount);
         updateBalance(userId, newRobberBalance);
 
-        replyMessage = `👮 **失敗...** 警察に見つかり、**${lossAmount.toLocaleString()}** コインを罰金として失いました。\nあなたの残高: **${newRobberBalance.toLocaleString()}** コイン`;
+        resultEmbed = new EmbedBuilder()
+            .setColor(0xFF0000)
+            .setTitle('👮 強盗失敗...')
+            .setDescription(`警察に見つかり、**${lossAmount.toLocaleString()}** コインを罰金として失いました。`)
+            .addFields({ name: 'あなたの残高', value: `**${newRobberBalance.toLocaleString()}** コイン`, inline: true })
+            .setTimestamp();
     }
 
     userCooldowns.set(userId, { ...cooldownData, rob: now });
 
-    await interaction.reply({ content: replyMessage });
+    await interaction.reply({ embeds: [resultEmbed] });
 }
 
 async function handleRoleAdd(interaction, userId, currentBalance) {
+    const errorEmbed = (title, description) => new EmbedBuilder().setColor(0xFF0000).setTitle(title).setDescription(description).setTimestamp();
+    
     if (!interaction.guild.members.me.permissions.has(PermissionsBitField.Flags.ManageRoles)) {
-        return interaction.reply({ content: 'ボットにロールを管理する権限がありません。管理者にご確認ください。', ephemeral: true });
+        return interaction.reply({ 
+            embeds: [errorEmbed('❌ 権限不足', 'ボットにロールを管理する権限がありません。管理者にご確認ください。')], 
+            ephemeral: true 
+        });
     }
 
     if (currentBalance < ROLE_ADD_COST) {
         return interaction.reply({ 
-            content: `コインが足りません。ロール作成には **${ROLE_ADD_COST.toLocaleString()}** コイン必要です。`, 
+            embeds: [errorEmbed('💰 コイン不足', `ロール作成には **${ROLE_ADD_COST.toLocaleString()}** コイン必要です。`)], 
             ephemeral: true 
         });
     }
@@ -330,7 +392,10 @@ async function handleRoleAdd(interaction, userId, currentBalance) {
     let roleColor = interaction.options.getString('color') || 'DEFAULT';
 
     if (roleColor !== 'DEFAULT' && !/^#?[0-9A-F]{6}$/i.test(roleColor)) {
-        return interaction.reply({ content: '色の指定は有効な16進数カラーコード（例: FF0000 または #FF0000）である必要があります。', ephemeral: true });
+        return interaction.reply({ 
+            embeds: [errorEmbed('🎨 不正な色コード', '色の指定は有効な16進数カラーコード（例: FF0000 または #FF0000）である必要があります。')], 
+            ephemeral: true 
+        });
     }
     if (roleColor !== 'DEFAULT' && !roleColor.startsWith('#')) {
         roleColor = `#${roleColor}`;
@@ -351,33 +416,43 @@ async function handleRoleAdd(interaction, userId, currentBalance) {
         const newBalance = currentBalance - ROLE_ADD_COST;
         updateBalance(userId, newBalance);
 
+        const successEmbed = new EmbedBuilder()
+            .setColor(0x00FF00)
+            .setTitle('🎉 ロール購入完了')
+            .setDescription(`ロール **${roleName}** を **${ROLE_ADD_COST.toLocaleString()}** コインで購入し、付与しました。`)
+            .addFields({ name: '現在の残高', value: `**${newBalance.toLocaleString()}** コイン`, inline: true })
+            .setTimestamp();
+
         await interaction.editReply({
-            content: `🎉 ロール **${roleName}** を **${ROLE_ADD_COST.toLocaleString()}** コインで購入し、付与しました。\n現在の残高: **${newBalance.toLocaleString()}** コイン`
+            embeds: [successEmbed]
         });
 
     } catch (error) {
         console.error('ロール作成エラー:', error);
-        await interaction.editReply({ 
-            content: 'ロールの作成または付与に失敗しました。ボットの権限設定（ロールがボットより上位でないかなど）を確認してください。' 
-        });
+        const failureEmbed = errorEmbed('⚠️ 処理失敗', 'ロールの作成または付与に失敗しました。ボットの権限設定（ロールがボットより上位でないかなど）を確認してください。');
+        await interaction.editReply({ embeds: [failureEmbed] });
     }
 }
 
 async function handleAdminMoney(interaction, isAdd) {
-    if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
-        return interaction.reply({ content: 'このコマンドは管理者のみ実行できます。', ephemeral: true });
-    }
-
     const targetUser = interaction.options.getUser('user');
     const targetRole = interaction.options.getRole('role');
     const amount = interaction.options.getInteger('money');
     const action = isAdd ? '追加' : '削減';
+    const color = isAdd ? 0x00FF00 : 0xFF0000;
+    
+    const adminErrorEmbed = (description) => new EmbedBuilder().setColor(0xFF0000).setTitle('❌ 権限エラー').setDescription(description).setTimestamp();
+    const inputErrorEmbed = (description) => new EmbedBuilder().setColor(0xFF8C00).setTitle('⚠️ 入力エラー').setDescription(description).setTimestamp();
+
+    if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
+        return interaction.reply({ embeds: [adminErrorEmbed('このコマンドは管理者のみ実行できます。')], ephemeral: true });
+    }
     
     if (!targetUser && !targetRole) {
-        return interaction.reply({ content: 'ユーザーまたはロールのいずれか一つを指定してください。', ephemeral: true });
+        return interaction.reply({ embeds: [inputErrorEmbed('ユーザーまたはロールのいずれか一つを指定してください。')], ephemeral: true });
     }
     if (targetUser && targetRole) {
-        return interaction.reply({ content: 'ユーザーとロールを同時に指定することはできません。どちらか一つに絞ってください。', ephemeral: true });
+        return interaction.reply({ embeds: [inputErrorEmbed('ユーザーとロールを同時に指定することはできません。どちらか一つに絞ってください。')], ephemeral: true });
     }
 
     await interaction.deferReply({ ephemeral: true });
@@ -408,37 +483,56 @@ async function handleAdminMoney(interaction, isAdd) {
 
         } catch (error) {
             console.error('ロールメンバーの取得エラー:', error);
-            return interaction.editReply({ content: 'ロールメンバーの取得中にエラーが発生しました。', ephemeral: true });
+            const fetchErrorEmbed = adminErrorEmbed('ロールメンバーの取得エラー', 'ロールメンバーの取得中にエラーが発生しました。');
+            return interaction.editReply({ embeds: [fetchErrorEmbed] });
         }
     }
 
     if (affectedCount === 0 && targetRole) {
+        const warningEmbed = new EmbedBuilder()
+            .setColor(0xFFFF00)
+            .setTitle('⚠️ 操作スキップ')
+            .setDescription(`**${targetRole.name}** ロールには有効なメンバーが見つからなかったため、操作は実行されませんでした。`)
+            .setTimestamp();
         return interaction.editReply({ 
-            content: `✅ 管理者操作: **${targetRole.name}** ロールには有効なメンバーが見つからなかったため、操作は実行されませんでした。`,
+            embeds: [warningEmbed],
             ephemeral: true
         });
     }
 
+    const successEmbed = new EmbedBuilder()
+        .setColor(color)
+        .setTitle(`✅ 管理者操作完了 (${action})`)
+        .setDescription(`${targetDescription} (${affectedCount}名) の残高に対して操作を行いました。`)
+        .addFields({ 
+            name: `${action}された金額`, 
+            value: `**${amount.toLocaleString()}** コイン`, 
+            inline: true 
+        })
+        .setTimestamp();
 
-    await interaction.editReply({
-        content: `✅ 管理者操作: ${targetDescription} (${affectedCount}名) の残高から **${amount.toLocaleString()}** コインを${action}しました。`,
-        ephemeral: true
-    });
+    await interaction.editReply({ embeds: [successEmbed] });
 }
 
 async function handleGive(interaction, userId, currentBalance) {
     const targetUser = interaction.options.getUser('user');
     const amount = interaction.options.getInteger('money');
 
+    const errorEmbed = (description) => new EmbedBuilder().setColor(0xFF0000).setTitle('❌ 送金失敗').setDescription(description).setTimestamp();
+
     if (targetUser.id === userId) {
-        return interaction.reply({ content: '自分自身に送金することはできません。', ephemeral: true });
+        return interaction.reply({ embeds: [errorEmbed('自分自身に送金することはできません。')], ephemeral: true });
     }
     if (targetUser.bot) {
-        return interaction.reply({ content: 'ボットに送金することはできません。', ephemeral: true });
+        return interaction.reply({ embeds: [errorEmbed('ボットに送金することはできません。')], ephemeral: true });
     }
 
     if (currentBalance < amount) {
-        return interaction.reply({ content: `送金に必要な **${amount.toLocaleString()}** コインが足りません。現在の残高: **${currentBalance.toLocaleString()}** コイン`, ephemeral: true });
+        return interaction.reply({ 
+            embeds: [errorEmbed(`送金に必要な **${amount.toLocaleString()}** コインが足りません。`)
+                .addFields({ name: '現在の残高', value: `${currentBalance.toLocaleString()} コイン`, inline: true })], 
+            ephemeral: true 
+        });
     }
 
     const targetBalance = getBalance(targetUser.id);
