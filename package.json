@@ -1,0 +1,21 @@
+{
+  "name": "discord-inmemory-economy-bot",
+  "version": "1.0.0",
+  "description": "Discord.js v14を使用した、インメモリ（データベースなし）のエコノミーボットです。",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": [
+    "discord",
+    "discord.js",
+    "economy",
+    "bot"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "discord.js": "^14.15.3",
+    "dotenv": "^16.4.5"
+  }
+}
