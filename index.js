@@ -11,16 +11,21 @@ const {
     EmbedBuilder
 } = require('discord.js');
 
+const express = require('express');
+
+// 環境変数から設定を取得
 const TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
 const GUILD_ID = process.env.GUILD_ID;
+// ホスティング環境の動的ポート（PaaS）に対応するため、環境変数PORTを優先
+const PORT = process.env.PORT || 8000; 
 
+// --- 経済システム (インメモリデータストア) ---
 const userBalance = new Map();
 const userCooldowns = new Map();
 
 const COOLDOWN_WORK_MS = 60 * 60 * 1000;
 const COOLDOWN_ROB_MS = 30 * 60 * 1000;
-
 const ROLE_ADD_COST = 10000;
 
 function getBalance(userId) {
@@ -45,6 +50,7 @@ function formatCooldown(ms) {
     return parts.join(' ');
 }
 
+// 午前0時のリセット処理
 function resetAllData() {
     userBalance.clear();
     userCooldowns.clear();
@@ -66,6 +72,7 @@ function scheduleDailyReset() {
     console.log(`[リセットスケジュール] 次回のリセットは ${midnight.toLocaleString('ja-JP')} (サーバー時刻) にスケジュールされました。`);
 }
 
+// --- Discord コマンド定義 ---
 
 const commands = [
     new SlashCommandBuilder()
@@ -156,12 +163,54 @@ const client = new Client({
     ] 
 });
 
-client.once('ready', async () => {
+// --- Express Webサーバー設定 ---
+
+const app = express();
+app.use(express.json()); 
+
+// CORS設定 (GASからのPOSTを許可)
+app.use((req, res, next) => {
+    res.setHeader('Access-Control-Allow-Origin', '*'); 
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    if (req.method === 'OPTIONS') {
+        return res.status(200).end();
+    }
+    next();
+});
+
+// GAS POST リクエスト処理エンドポイント
+app.post('/gas/post', (req, res) => {
+    const timestamp = new Date().toISOString();
+    console.log(`[WEBHOOK] ${timestamp} (UTC) --- GASからのPOSTリクエストを受信しました ---`);
+    console.log('Received Data (受信したデータ):', req.body);
+    console.log('------------------------------------------------------------------------');
+
+    // 受信したデータ (req.body) を利用して、ボットの経済システムを更新したり、
+    // Discordに通知メッセージを送ったりする処理をここに追加できます。
+    // 例: client.channels.cache.get('チャンネルID').send(`GASからデータを受信: ${JSON.stringify(req.body)}`);
+
+    // 受信確認の応答をGASに返す
+    res.status(200).json({ 
+        status: 'success', 
+        message: 'Webサーバーでデータを受信しました。', 
+        data_received: req.body 
+    });
+});
+
+// サーバー起動確認用のGETリクエスト
+app.get('/', (req, res) => {
+    res.status(200).send(`Discord BOTとWebサーバーは正常に動作しており、ポート ${PORT} で待機中です。`);
+});
+
+
+// --- Discord イベントハンドラー ---
+
+client.once('clientReady', async () => {
     const timestamp = new Date().toISOString();
     console.log(`[BOT READY] ${timestamp} (UTC): Logged in as ${client.user.tag}`);
 
     scheduleDailyReset();
-
 
     const rest = new REST({ version: '10' }).setToken(TOKEN);
 
@@ -249,6 +298,8 @@ client.on('interactionCreate', async interaction => {
         }
     }
 });
+
+// --- コマンド実行ヘルパー関数 ---
 
 async function handleWork(interaction, userId, currentBalance) {
     const now = Date.now();
@@ -556,6 +607,14 @@ async function handleGive(interaction, userId, currentBalance) {
     await interaction.reply({ embeds: [embed] });
 }
 
+// --- ボットとサーバーの起動 ---
+
+// Expressサーバーを起動
+app.listen(PORT, () => {
+    console.log(`Webサーバーがポート ${PORT} で起動しました。`);
+});
+
+// Discordクライアントにログイン
 client.login(TOKEN);
 
 client.on('error', err => {
