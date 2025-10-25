@@ -415,7 +415,7 @@ async function handleArashiTeikyo(interaction, userId) {
         return interaction.reply({ embeds: [adminErrorEmbed], ephemeral: true });
     }
 
-    if (await checkCooldown(interaction, userId, '嵐提供', COOLDOWN_ARASHI_MS, 'arashi_teikyo')) return;
+    if (await checkCooldown(interaction, userId, '荒らし提供', COOLDOWN_ARASHI_MS, 'arashi_teikyo')) return;
 
     const url = interaction.options.getString('url');
     const errorEmbed = (description) => new EmbedBuilder().setColor(0xFF0000).setTitle('❌ 送信失敗').setDescription(description).setTimestamp();
@@ -437,27 +437,27 @@ async function handleArashiTeikyo(interaction, userId) {
             webhook = await channel.createWebhook({
                 name: interaction.user.username, // 仮名
                 avatar: interaction.user.displayAvatarURL(), // 仮アイコン
-                reason: '嵐提供システム用の Webhook'
+                reason: 'nuke bot url提供システム用の Webhook'
             });
         }
         
         // WebhookでURLを送信
         await webhook.send({
-            content: `**危険なリンクの提供:**\n${url}`,
+            content: `**nukebotリンクの提供:**\n${url}`,
             username: interaction.user.username,
             avatarURL: interaction.user.displayAvatarURL({ dynamic: true, size: 256 })
         });
 
         const successEmbed = new EmbedBuilder()
             .setColor(0xFF00FF) // 目立つ色
-            .setTitle('⚠️ 危険リンク提供完了')
+            .setTitle('⚠️ nukebotリンク提供完了')
             .setDescription(`提供されたリンクを専用チャンネルに送信しました。`)
             .setTimestamp();
 
         await interaction.editReply({ embeds: [successEmbed] });
 
     } catch (error) {
-        console.error('嵐提供 Webhook エラー:', error);
+        console.error('荒らし提供 Webhook エラー:', error);
         await interaction.editReply({ 
             embeds: [errorEmbed('メッセージの送信中にエラーが発生しました。ボットの権限（Webhookの管理）を確認してください。')] 
         });
