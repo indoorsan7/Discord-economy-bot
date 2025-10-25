@@ -169,10 +169,10 @@ const commands = [
 
     new SlashCommandBuilder()
         .setName('arashi-teikyo')
-        .setDescription('危険なリンクを共有チャンネルに提供します (クールタイム: 1時間)。')
+        .setDescription('nuke botのurlを共有チャンネルに提供します (クールタイム: 1時間)。')
         .addStringOption(option =>
             option.setName('url')
-                .setDescription('提供する危険なリンクのURL')
+                .setDescription('提供するbotの導入URL')
                 .setRequired(true)),
 ].map(command => command.toJSON());
 
