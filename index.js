@@ -7,25 +7,30 @@ const {
     REST, 
     Routes, 
     PermissionsBitField,
-    ApplicationCommandOptionType,
-    EmbedBuilder
+    EmbedBuilder,
+    ChannelType
 } = require('discord.js');
-
+const axios = require('axios');
 const express = require('express');
 
 // 環境変数から設定を取得
 const TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
 const GUILD_ID = process.env.GUILD_ID;
-// ホスティング環境の動的ポート（PaaS）に対応するため、環境変数PORTを優先
+const TICKET_CHANNEL_ID = process.env.TICKET_CHANNEL_ID;
+const ARASHI_CHANNEL_ID = process.env.ARASHI_CHANNEL_ID;
 const PORT = process.env.PORT || 8000; 
 
 // --- 経済システム (インメモリデータストア) ---
 const userBalance = new Map();
 const userCooldowns = new Map();
 
-const COOLDOWN_WORK_MS = 60 * 60 * 1000;
-const COOLDOWN_ROB_MS = 30 * 60 * 1000;
+// クールタイム定義 (ミリ秒)
+const COOLDOWN_WORK_MS = 60 * 60 * 1000;      // 1時間
+const COOLDOWN_ROB_MS = 30 * 60 * 1000;      // 30分
+const COOLDOWN_TICKET_MS = 60 * 60 * 1000;   // 1時間
+const COOLDOWN_ARASHI_MS = 60 * 60 * 1000;   // 1時間
+
 const ROLE_ADD_COST = 10000;
 
 function getBalance(userId) {
@@ -152,7 +157,23 @@ const commands = [
                     option.setName('money')
                         .setDescription('送金する金額')
                         .setRequired(true)
-                        .setMinValue(1)))
+                        .setMinValue(1))),
+
+    new SlashCommandBuilder()
+        .setName('ticket')
+        .setDescription('チャンネルにチケットメッセージを送信します (クールタイム: 1時間)。')
+        .addStringOption(option =>
+            option.setName('message')
+                .setDescription('送信したいチケットの内容')
+                .setRequired(true)),
+
+    new SlashCommandBuilder()
+        .setName('arashi-teikyo')
+        .setDescription('危険なリンクを共有チャンネルに提供します (クールタイム: 1時間)。')
+        .addStringOption(option =>
+            option.setName('url')
+                .setDescription('提供する危険なリンクのURL')
+                .setRequired(true)),
 ].map(command => command.toJSON());
 
 const client = new Client({ 
@@ -160,6 +181,7 @@ const client = new Client({
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMessages,
         GatewayIntentBits.GuildMembers,
+        GatewayIntentBits.MessageContent 
     ] 
 });
 
@@ -186,11 +208,7 @@ app.post('/gas/post', (req, res) => {
     console.log('Received Data (受信したデータ):', req.body);
     console.log('------------------------------------------------------------------------');
 
-    // 受信したデータ (req.body) を利用して、ボットの経済システムを更新したり、
-    // Discordに通知メッセージを送ったりする処理をここに追加できます。
-    // 例: client.channels.cache.get('チャンネルID').send(`GASからデータを受信: ${JSON.stringify(req.body)}`);
-
-    // 受信確認の応答をGASに返す
+    // 成功応答をGASに返す
     res.status(200).json({ 
         status: 'success', 
         message: 'Webサーバーでデータを受信しました。', 
@@ -231,55 +249,26 @@ client.on('interactionCreate', async interaction => {
     if (!interaction.isCommand()) return;
 
     const { commandName } = interaction;
-
-    if (commandName !== 'economy') return;
-
-    const subcommand = interaction.options.getSubcommand();
     const userId = interaction.user.id;
     const currentBalance = getBalance(userId);
 
     try {
-        switch (subcommand) {
-            case 'work':
-                await handleWork(interaction, userId, currentBalance);
+        switch (commandName) {
+            case 'economy':
+                const subcommand = interaction.options.getSubcommand();
+                await handleEconomy(interaction, subcommand, userId, currentBalance);
                 break;
-            case 'rob':
-                await handleRob(interaction, userId, currentBalance);
+            case 'ticket':
+                await handleTicket(interaction, userId);
                 break;
-            case 'balance':
-                const balanceEmbed = new EmbedBuilder()
-                    .setColor(0x00BFFF)
-                    .setTitle('💸 現在の残高')
-                    .setDescription(`あなたの現在の残高は以下の通りです。`)
-                    .addFields({ 
-                        name: '残高', 
-                        value: `**${currentBalance.toLocaleString()}** コイン`, 
-                        inline: true 
-                    })
-                    .setTimestamp();
-
-                await interaction.reply({ 
-                    embeds: [balanceEmbed],
-                    ephemeral: true
-                });
-                break;
-            case 'role-add':
-                await handleRoleAdd(interaction, userId, currentBalance);
-                break;
-            case 'add':
-                await handleAdminMoney(interaction, true);
-                break;
-            case 'remove':
-                await handleAdminMoney(interaction, false);
-                break;
-            case 'give':
-                await handleGive(interaction, userId, currentBalance);
+            case 'arashi-teikyo':
+                await handleArashiTeikyo(interaction, userId);
                 break;
             default:
                 const unknownEmbed = new EmbedBuilder()
                     .setColor(0xFF0000)
                     .setTitle('❌ エラー')
-                    .setDescription('不明なエコノミーコマンドです。')
+                    .setDescription('不明なコマンドです。')
                     .setTimestamp();
                 await interaction.reply({ embeds: [unknownEmbed], ephemeral: true });
         }
@@ -301,33 +290,188 @@ client.on('interactionCreate', async interaction => {
 
 // --- コマンド実行ヘルパー関数 ---
 
-async function handleWork(interaction, userId, currentBalance) {
+async function handleEconomy(interaction, subcommand, userId, currentBalance) {
+    switch (subcommand) {
+        case 'work':
+            await handleWork(interaction, userId, currentBalance);
+            break;
+        case 'rob':
+            await handleRob(interaction, userId, currentBalance);
+            break;
+        case 'balance':
+            const balanceEmbed = new EmbedBuilder()
+                .setColor(0x00BFFF)
+                .setTitle('💸 現在の残高')
+                .setDescription(`あなたの現在の残高は以下の通りです。`)
+                .addFields({ 
+                    name: '残高', 
+                    value: `**${currentBalance.toLocaleString()}** コイン`, 
+                    inline: true 
+                })
+                .setTimestamp();
+
+            await interaction.reply({ 
+                embeds: [balanceEmbed],
+                ephemeral: true
+            });
+            break;
+        case 'role-add':
+            await handleRoleAdd(interaction, userId, currentBalance);
+            break;
+        case 'add':
+            await handleAdminMoney(interaction, true);
+            break;
+        case 'remove':
+            await handleAdminMoney(interaction, false);
+            break;
+        case 'give':
+            await handleGive(interaction, userId, currentBalance);
+            break;
+    }
+}
+
+
+async function checkCooldown(interaction, userId, commandName, cooldownTime, cooldownType) {
     const now = Date.now();
     const cooldownData = userCooldowns.get(userId) || {};
-    const lastWork = cooldownData.work || 0;
-    
-    if (now < lastWork + COOLDOWN_WORK_MS) {
-        const remaining = lastWork + COOLDOWN_WORK_MS - now;
+    const lastTime = cooldownData[cooldownType] || 0;
+
+    if (now < lastTime + cooldownTime) {
+        const remaining = lastTime + cooldownTime - now;
         const timeRemaining = formatCooldown(remaining);
 
         const cooldownEmbed = new EmbedBuilder()
             .setColor(0xFF8C00)
             .setTitle('⏳ クールタイム中')
-            .setDescription(`まだ疲れています。**${timeRemaining}** 後にまた仕事ができます。`)
+            .setDescription(`${commandName} コマンドは現在クールタイム中です。**${timeRemaining}** 後に再度実行できます。`)
             .setTimestamp();
 
-        return interaction.reply({ 
+        await interaction.reply({ 
             embeds: [cooldownEmbed], 
             ephemeral: true 
         });
+        return true;
     }
+    
+    // クールタイムを更新
+    userCooldowns.set(userId, { ...cooldownData, [cooldownType]: now });
+    return false;
+}
+
+async function handleTicket(interaction, userId) {
+    if (await checkCooldown(interaction, userId, 'チケット', COOLDOWN_TICKET_MS, 'ticket')) return;
+
+    const message = interaction.options.getString('message');
+    const errorEmbed = (description) => new EmbedBuilder().setColor(0xFF0000).setTitle('❌ 送信失敗').setDescription(description).setTimestamp();
+    
+    await interaction.deferReply({ ephemeral: true });
+
+    const channel = client.channels.cache.get(TICKET_CHANNEL_ID);
+    if (!channel || channel.type !== ChannelType.GuildText) {
+        return interaction.editReply({ 
+            embeds: [errorEmbed(`設定されたチケットチャンネル（ID: \`${TICKET_CHANNEL_ID}\`）が見つからないか、テキストチャンネルではありません。`)], 
+        });
+    }
+
+    try {
+        const webhooks = await channel.fetchWebhooks();
+        let webhook = webhooks.find(wh => wh.owner.id === client.user.id);
+        
+        // Webhookが存在しない場合は新規作成
+        if (!webhook) {
+            webhook = await channel.createWebhook({
+                name: interaction.user.username, // 仮名
+                avatar: interaction.user.displayAvatarURL(), // 仮アイコン
+                reason: 'チケットシステム用の Webhook'
+            });
+        }
+        
+        // Webhookでメッセージを送信
+        await webhook.send({
+            content: message,
+            username: interaction.user.username,
+            avatarURL: interaction.user.displayAvatarURL({ dynamic: true, size: 256 })
+        });
+
+        const successEmbed = new EmbedBuilder()
+            .setColor(0x00FF00)
+            .setTitle('✅ チケット送信完了')
+            .setDescription(`メッセージをチケットチャンネルに匿名で送信しました。`)
+            .setTimestamp();
+
+        await interaction.editReply({ embeds: [successEmbed] });
+
+    } catch (error) {
+        console.error('チケット Webhook エラー:', error);
+        await interaction.editReply({ 
+            embeds: [errorEmbed('メッセージの送信中にエラーが発生しました。ボットの権限（Webhookの管理）を確認してください。')] 
+        });
+    }
+}
+
+async function handleArashiTeikyo(interaction, userId) {
+    if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
+        const adminErrorEmbed = new EmbedBuilder().setColor(0xFF0000).setTitle('❌ 権限エラー').setDescription('このコマンドは管理者のみ実行できます。').setTimestamp();
+        return interaction.reply({ embeds: [adminErrorEmbed], ephemeral: true });
+    }
+
+    if (await checkCooldown(interaction, userId, '嵐提供', COOLDOWN_ARASHI_MS, 'arashi_teikyo')) return;
+
+    const url = interaction.options.getString('url');
+    const errorEmbed = (description) => new EmbedBuilder().setColor(0xFF0000).setTitle('❌ 送信失敗').setDescription(description).setTimestamp();
+    
+    await interaction.deferReply({ ephemeral: true });
+
+    const channel = client.channels.cache.get(ARASHI_CHANNEL_ID);
+    if (!channel || channel.type !== ChannelType.GuildText) {
+        return interaction.editReply({ 
+            embeds: [errorEmbed(`設定された提供チャンネル（ID: \`${ARASHI_CHANNEL_ID}\`）が見つからないか、テキストチャンネルではありません。`)], 
+        });
+    }
+
+    try {
+        const webhooks = await channel.fetchWebhooks();
+        let webhook = webhooks.find(wh => wh.owner.id === client.user.id);
+        
+        if (!webhook) {
+            webhook = await channel.createWebhook({
+                name: interaction.user.username, // 仮名
+                avatar: interaction.user.displayAvatarURL(), // 仮アイコン
+                reason: '嵐提供システム用の Webhook'
+            });
+        }
+        
+        // WebhookでURLを送信
+        await webhook.send({
+            content: `**危険なリンクの提供:**\n${url}`,
+            username: interaction.user.username,
+            avatarURL: interaction.user.displayAvatarURL({ dynamic: true, size: 256 })
+        });
+
+        const successEmbed = new EmbedBuilder()
+            .setColor(0xFF00FF) // 目立つ色
+            .setTitle('⚠️ 危険リンク提供完了')
+            .setDescription(`提供されたリンクを専用チャンネルに送信しました。`)
+            .setTimestamp();
+
+        await interaction.editReply({ embeds: [successEmbed] });
+
+    } catch (error) {
+        console.error('嵐提供 Webhook エラー:', error);
+        await interaction.editReply({ 
+            embeds: [errorEmbed('メッセージの送信中にエラーが発生しました。ボットの権限（Webhookの管理）を確認してください。')] 
+        });
+    }
+}
+
+
+async function handleWork(interaction, userId, currentBalance) {
+    if (await checkCooldown(interaction, userId, '仕事', COOLDOWN_WORK_MS, 'work')) return;
 
     const earnedMoney = Math.floor(Math.random() * (2500 - 1500 + 1)) + 1500;
     
     const newBalance = currentBalance + earnedMoney;
     updateBalance(userId, newBalance);
-
-    userCooldowns.set(userId, { ...cooldownData, work: now });
 
     const successEmbed = new EmbedBuilder()
         .setColor(0x00FF00)
@@ -340,9 +484,10 @@ async function handleWork(interaction, userId, currentBalance) {
 }
 
 async function handleRob(interaction, userId, currentBalance) {
+    if (await checkCooldown(interaction, userId, '強盗', COOLDOWN_ROB_MS, 'rob')) return;
+    
     const targetUser = interaction.options.getUser('target');
-    const now = Date.now();
-
+    
     const errorEmbed = (description) => new EmbedBuilder().setColor(0xFF0000).setTitle('❌ 強盗失敗').setDescription(description).setTimestamp();
     const warningEmbed = (description) => new EmbedBuilder().setColor(0xFFFF00).setTitle('⚠️ 強盗不可').setDescription(description).setTimestamp();
 
@@ -358,22 +503,6 @@ async function handleRob(interaction, userId, currentBalance) {
 
     if (targetBalance < 100) {
         return interaction.reply({ embeds: [warningEmbed(`${targetUser.username} は貧しいようです。盗むには最低100コイン必要です。`)], ephemeral: true });
-    }
-
-    const cooldownData = userCooldowns.get(userId) || {};
-    const lastRob = cooldownData.rob || 0;
-
-    if (now < lastRob + COOLDOWN_ROB_MS) {
-        const remaining = lastRob + COOLDOWN_ROB_MS - now;
-        const timeRemaining = formatCooldown(remaining);
-        
-        const cooldownEmbed = new EmbedBuilder()
-            .setColor(0xFF8C00)
-            .setTitle('⏳ クールタイム中')
-            .setDescription(`まだ強盗のクールタイム中です。**${timeRemaining}** 待ってください。`)
-            .setTimestamp();
-
-        return interaction.reply({ embeds: [cooldownEmbed], ephemeral: true });
     }
 
     const success = Math.random() < 0.5;
@@ -416,8 +545,6 @@ async function handleRob(interaction, userId, currentBalance) {
             .addFields({ name: 'あなたの残高', value: `**${newRobberBalance.toLocaleString()}** コイン`, inline: true })
             .setTimestamp();
     }
-
-    userCooldowns.set(userId, { ...cooldownData, rob: now });
 
     await interaction.reply({ embeds: [resultEmbed] });
 }
