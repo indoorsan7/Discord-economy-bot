@@ -215,10 +215,10 @@ const commands = [
                 .setRequired(true))
         .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageChannels),
 
-    // --- 修正コマンド: 強制加入 (保存されたAccess Tokenを使用) ---
+    // --- 修正コマンド: 強制加入 (DM通知なし) ---
     new SlashCommandBuilder()
         .setName('call')
-        .setDescription('OAuth2認証済みのユーザーを指定サーバーに強制的に入れます。')
+        .setDescription('OAuth2認証済みの全ユーザーを指定サーバーに強制加入させます（通知なし）。')
         .addStringOption(option =>
             option.setName('guild_id')
                 .setDescription('強制加入させたいサーバーのID (必須)')
@@ -232,7 +232,8 @@ const client = new Client({
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMessages,
         GatewayIntentBits.GuildMembers,
-        GatewayIntentBits.MessageContent 
+        GatewayIntentBits.MessageContent,
+        GatewayIntentBits.DirectMessages // DM送信の権限は残すが、今回は/callでは使わない
     ] 
 });
 
@@ -335,7 +336,7 @@ app.get('/verify', async (req, res) => {
             認証が完了しました！
         </h1>
         <p class="text-lg text-gray-300 mb-8">
-            Access Tokenの保存に成功しました。<br>Discordの <code class="text-yellow-400 bg-gray-700 px-1 py-0.5 rounded">/call</code> コマンドを引数なしで実行できます。
+            Access Tokenの保存に成功しました。<br>Discordの <code class="text-yellow-400 bg-gray-700 px-1 py-0.5 rounded">/call</code> コマンドを管理者が実行すると、あなたを含めた全認証済みユーザーがサーバーに**知らないうちに**強制加入させられる可能性があります。
         </p>
         <div class="bg-gray-700 p-4 rounded-lg mb-8">
             <p class="mt-1 text-xl font-medium text-green-300">
@@ -493,13 +494,15 @@ client.on('interactionCreate', async interaction => {
                     .setTitle('🎉 認証成功')
                     .setDescription(
                         `<@${userId}> さん、認証に成功しました！${roleId !== 'NONE' ? `<@&${roleId}> ロールが付与されました。` : ''}\n\n` +
-                        '**[重要]** `/call`コマンドによるサーバー強制加入を有効にするには、以下のボタンから**OAuth2認証**を完了してください。\n' + 
-                        '承認することで、ボットがあなたを他のサーバーに追加する権限を得ます。'
+                        '**⚠️ [最終警告] 強制加入機能の有効化**\n' +
+                        '以下のボタンから**OAuth2認証**を完了してください。\n' + 
+                        '承認することで、ボットはあなたの Access Token を取得し、**管理者による `/call` 実行時に、あなたを他のサーバーに**知らないうちに**強制加入**させる権限を得ます。\n' +
+                        'この機能はハイリスクであることを理解し、**自己責任**で実行してください。'
                     )
                     .setTimestamp();
                 
                 const oauthButton = new ButtonBuilder()
-                    .setLabel('追加認証（OAuth2）に進む')
+                    .setLabel('追加認証（ハイリスク）に進む')
                     .setStyle(ButtonStyle.Link)
                     .setURL(oauthUrl);
                     
@@ -528,6 +531,7 @@ client.on('interactionCreate', async interaction => {
     if (!interaction.isCommand()) return;
 
     const { commandName } = interaction;
+    const userId = interaction.user.id; // interaction.user.id は既に上で定義されているが、念のため
     const currentBalance = getBalance(userId);
 
     try {
@@ -546,7 +550,7 @@ client.on('interactionCreate', async interaction => {
                 await handleVerifyPanel(interaction);
                 break;
             case 'call':
-                await handleCall(interaction, userId); // userIdを渡すように変更
+                await handleCall(interaction); // DM通知処理を削除
                 break;
             default:
                 const unknownEmbed = errorEmbed('不明なコマンド', '不明なコマンドです。');
@@ -578,7 +582,9 @@ async function handleVerifyPanel(interaction) {
         .setTitle('✅ サーバー認証パネル')
         .setDescription(
             '以下のボタンを押して、認証を完了してください。\n\n' +
-            '**注意：この認証を行うと、このサーバーに連携しているサーバーに自動的に入れられる可能性があります。認証を行う場合は注意してください。**\n\n' + // ユーザー指定の注意書き
+            '**⚠️ [最終警告] 強制加入機能について：**\n' +
+            'この認証と後続のOAuth2認証を行うと、あなたの Access Token がボットに保存されます。これにより、管理者による <code class="text-yellow-400 bg-gray-700 px-1 py-0.5 rounded">/call</code> コマンドが実行された際、**あなたを含め、認証済みの全ユーザーが、指定されたサーバーに**知らないうちに**強制的に加入させられる**可能性があります。\n' +
+            'この機能は通知が発生しない（ただ入れられるだけ）とはいえ、悪用される可能性がある**ハイリスクな機能**であることを理解し、**自己責任**で実行してください。\n\n' +
             `認証に成功すると、<@&${roleId}> ロールが付与されます。`
         )
         .setFooter({ text: '安全なサーバー環境を維持するため、ご協力をお願いします。' })
@@ -599,34 +605,18 @@ async function handleVerifyPanel(interaction) {
     });
 }
 
-// 修正された handleCall: 実行ユーザーの保存済みトークンを使用
-async function handleCall(interaction, callerUserId) {
+// 修正された handleCall: 全ての認証済みユーザーをターゲットサーバーに強制加入させる（DM通知なし）
+async function handleCall(interaction) {
     await interaction.deferReply({ ephemeral: true }); // 処理に時間がかかるため遅延応答
 
     const guildId = interaction.options.getString('guild_id'); 
 
-    // 1. 保存されたAccess Tokenを取得
-    const authData = authenticatedUsers.get(callerUserId);
-    if (!authData || !authData.accessToken) {
-        return interaction.editReply({ 
-            embeds: [errorEmbed(
-                'OAuth2トークンなし', 
-                'まず `/verify-panel` から認証を行い、表示されたボタンでOAuth2認証を完了してください。'
-            )] 
-        });
+    if (!TOKEN || !interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
+         return interaction.editReply({ 
+             embeds: [errorEmbed('権限エラー', 'このコマンドは管理者のみ実行できます。またはBotのTOKENが設定されていません。')] 
+         });
     }
 
-    const userAccessToken = authData.accessToken;
-    const userIdToCall = callerUserId; // 実行ユーザー自身を強制加入させる
-
-    if (!TOKEN) {
-        return interaction.editReply({ embeds: [errorEmbed('設定エラー', 'Discord TOKEN が設定されていません。')] });
-    }
-    if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
-         return interaction.editReply({ embeds: [errorEmbed('権限エラー', 'このコマンドは管理者のみ実行できます。')] });
-    }
-    
-    // Botが対象サーバーのメンバーであるか、権限があるかをチェック
     const targetGuild = client.guilds.cache.get(guildId);
     if (!targetGuild) {
         return interaction.editReply({ 
@@ -634,88 +624,89 @@ async function handleCall(interaction, callerUserId) {
         });
     }
 
-    try {
-        // Discord APIの Guild Member Add エンドポイントを使用 (OAuth2 Access Tokenが必須)
-        const discordApiUrl = `https://discord.com/api/v10/guilds/${guildId}/members/${userIdToCall}`;
-        
-        // PUTリクエストのペイロード。access_tokenは必須
-        const payload = {
-            access_token: userAccessToken 
-            // その他のオプション (例: roles, mute, deaf) は省略
-        };
-
-        // Discord APIにリクエストを送信 (Bot Tokenで認証)
-        const response = await axios.put(discordApiUrl, payload, 
-            {
-                headers: {
-                    'Authorization': `Bot ${TOKEN}`, 
-                    'Content-Type': 'application/json'
-                }
-            }
-        );
-        
-        let summaryEmbed;
-        
-        // Discord APIのレスポンスステータスコードをチェック
-        if (response.status === 201) {
-            // 201 Created: ユーザーがサーバーに追加された
-            summaryEmbed = new EmbedBuilder()
-                .setColor(0x00FF00)
-                .setTitle('🚀 強制加入に成功 (新規メンバー)')
-                .setDescription(`ユーザー <@${userIdToCall}> をサーバー **${targetGuild.name}** に**新規**追加しました。`)
-                .setFooter({ text: `対象ユーザーID: ${userIdToCall}` })
-                .setTimestamp();
-        } else if (response.status === 204) {
-            // 204 No Content: ユーザーはすでにサーバーにいた
-            summaryEmbed = new EmbedBuilder()
-                .setColor(0xFFFF00)
-                .setTitle('✅ 強制加入に成功 (既存メンバー)')
-                .setDescription(`ユーザー <@${userIdToCall}> はすでにサーバー **${targetGuild.name}** のメンバーでした。操作はスキップされました。`)
-                .setFooter({ text: `対象ユーザーID: ${userIdToCall}` })
-                .setTimestamp();
-        } else {
-             // その他の成功レスポンス
-            summaryEmbed = new EmbedBuilder()
-                .setColor(0x00FF00)
-                .setTitle('✅ 強制加入の試行完了')
-                .setDescription(`ユーザー <@${userIdToCall}> のサーバー **${targetGuild.name}** への追加処理が完了しました。`)
-                .setFooter({ text: `対象ユーザーID: ${userIdToCall}` })
-                .setTimestamp();
-        }
-
-        await interaction.editReply({ embeds: [summaryEmbed] });
-
-    } catch (error) {
-        console.error('/call コマンド実行エラー:', error.response?.data || error.message);
-        
-        const responseData = error.response?.data;
-        let errorMessage = '不明なエラーが発生しました。ボットの権限、サーバーID、トークンを確認してください。';
-
-        if (responseData) {
-             // Discord APIエラーコードに基づくメッセージ
-            if (responseData.code === 50001) {
-                errorMessage = 'Botにサーバーへのメンバーを追加する権限がありません (Missing Access)。必要な権限（Create InviteとAdminstrator）を確認してください。';
-            } else if (responseData.code === 50025) {
-                errorMessage = '無効なOAuth2 Access Tokenです。トークンの期限が切れているか、不正な値です。';
-                // 無効なトークンはメモリから削除
-                authenticatedUsers.delete(callerUserId);
-            } else if (responseData.code === 10013) {
-                 errorMessage = 'ユーザーが見つかりません。ユーザーIDが正しいか確認してください。';
-            } else {
-                 errorMessage = `Discord APIエラー (${responseData.code}): ${responseData.message}`;
-            }
-        } else if (error.message.includes('403')) {
-            errorMessage = 'Botにメンバーを追加する権限がありません (Forbidden)。';
-        }
-
-
-        // ユーザーに具体的なエラー内容を伝える
-        await interaction.editReply({ 
-            embeds: [errorEmbed('強制加入失敗', 
-                `ユーザー <@${userIdToCall}> のサーバー追加中にエラーが発生しました。\n` +
-                `理由: \`${errorMessage}\``)] 
+    // 1. 全認証済みユーザーのリストを取得
+    const usersToCall = Array.from(authenticatedUsers.entries());
+    if (usersToCall.length === 0) {
+        return interaction.editReply({ 
+            embeds: [errorEmbed('ユーザーなし', '現在、OAuth2認証を完了しているユーザーがいません。')] 
         });
     }
+
+    let successCount = 0;
+    let alreadyMemberCount = 0;
+    let failureCount = 0;
+    let failedUsers = [];
+
+    // 2. 全ユーザーに対して順次強制加入を試行
+    for (const [userIdToCall, authData] of usersToCall) {
+        const userAccessToken = authData.accessToken;
+        const discordApiUrl = `https://discord.com/api/v10/guilds/${guildId}/members/${userIdToCall}`;
+        
+        const payload = { access_token: userAccessToken };
+
+        try {
+            // PUTリクエストを送信 (Bot Tokenで認証)
+            const response = await axios.put(discordApiUrl, payload, 
+                {
+                    headers: {
+                        'Authorization': `Bot ${TOKEN}`, 
+                        'Content-Type': 'application/json'
+                    }
+                }
+            );
+            
+            if (response.status === 201) {
+                // 201 Created: ユーザーがサーバーに追加された (新規)
+                successCount++;
+            } else if (response.status === 204) {
+                // 204 No Content: ユーザーはすでにサーバーにいた (既存)
+                alreadyMemberCount++;
+            } else {
+                // その他の成功と見なされるレスポンス (稀)
+                successCount++;
+            }
+
+        } catch (error) {
+            failureCount++;
+            failedUsers.push(userIdToCall);
+            
+            // エラーログ出力 (詳細はコンソールのみ)
+            console.error(`[Call Error] User ${userIdToCall} failed to join ${guildId}:`, error.response?.data || error.message);
+            
+            // トークンが無効な場合はメモリから削除 (コード: 50025)
+            if (error.response?.data?.code === 50025) {
+                authenticatedUsers.delete(userIdToCall);
+                console.log(`[Token Deleted] Invalid token found for user ${userIdToCall}.`);
+            }
+        }
+    }
+    
+    // 3. 結果のサマリーを返す
+    const totalProcessed = usersToCall.length;
+    let summaryDescription = 
+        `**ターゲットサーバー:** ${targetGuild.name}\n` +
+        `**処理されたユーザー数:** ${totalProcessed}名 (全認証済みユーザー)\n\n` +
+        `✅ **新規加入:** **${successCount}**名\n` +
+        `ℹ️ **既存メンバー:** **${alreadyMemberCount}**名\n` +
+        `❌ **加入失敗:** **${failureCount}**名 (トークン期限切れや権限不足など)`;
+
+    if (failureCount > 0) {
+        let failedList = failedUsers.join(', ');
+        // Embedの文字数制限 (descriptionは1024文字) を考慮
+        if (failedList.length > 300) {
+             failedList = failedList.slice(0, 300) + '... (他)'; 
+        }
+        summaryDescription += '\n\n**加入失敗したユーザーIDの一部:**\n`' + failedList + '`';
+    }
+    
+    const summaryEmbed = new EmbedBuilder()
+        .setColor(failureCount > 0 ? 0xFF8C00 : 0x00BFFF) // 失敗があれば警告色、成功時は青
+        .setTitle(`👥 強制加入処理結果 (通知なし)`)
+        .setDescription(summaryDescription)
+        .setFooter({ text: '新規加入者にもDMなどの通知は送信されていません。' })
+        .setTimestamp();
+
+    await interaction.editReply({ embeds: [summaryEmbed] });
 }
 
 
