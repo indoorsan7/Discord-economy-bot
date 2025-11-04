@@ -426,7 +426,7 @@ client.once('clientReady', async () => {
 
 
 client.on('interactionCreate', async interaction => {
-    const userId = interaction.user.id;
+    const userId = interaction.user.id; // 1回目：ここで宣言
     
     // --- ボタンのインタラクション処理 ---
     if (interaction.isButton() && interaction.customId === VERIFY_BUTTON_ID) {
@@ -531,7 +531,7 @@ client.on('interactionCreate', async interaction => {
     if (!interaction.isCommand()) return;
 
     const { commandName } = interaction;
-    const userId = interaction.user.id; // interaction.user.id は既に上で定義されているが、念のため
+    // const userId = interaction.user.id; // <-- 2回目：この二重宣言をコメントアウト/削除します
     const currentBalance = getBalance(userId);
 
     try {
