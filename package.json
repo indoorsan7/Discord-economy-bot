@@ -1,15 +1,25 @@
 {
-  "name": "discord-economy-web-server",
+  "name": "discord-bot-firestore",
   "version": "1.0.0",
-  "description": "Discord Economy Bot with Express Web Server and GAS Integration",
+  "description": "Discord Bot with Express Web Server and Firebase Firestore Persistence",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
+  "keywords": [
+    "discord",
+    "bot",
+    "firestore",
+    "express",
+    "oauth2"
+  ],
+  "author": "",
+  "license": "ISC",
   "dependencies": {
-    "axios": "^1.7.2", 
-    "discord.js": "^14.15.3",
+    "axios": "^1.6.8",
+    "discord.js": "^14.15.2",
     "dotenv": "^16.4.5",
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "firebase-admin": "^12.1.0"
   }
 }
