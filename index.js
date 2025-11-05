@@ -1,9 +1,5 @@
 require('dotenv').config();
 
-// Firebase Admin SDK
-const admin = require('firebase-admin');
-const { getFirestore } = require('firebase-admin/firestore');
-
 const { 
     Client, 
     GatewayIntentBits, 
@@ -12,748 +8,344 @@ const {
     Routes, 
     PermissionsBitField,
     EmbedBuilder,
-    ChannelType,
-    ActionRowBuilder,
-    ButtonBuilder,
-    ButtonStyle
+    ChannelType
 } = require('discord.js');
 const axios = require('axios');
 const express = require('express');
 
-// --- 環境変数から設定を取得 ---
+// 環境変数から設定を取得
 const TOKEN = process.env.DISCORD_TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
-const GUILD_ID = process.env.GUILD_ID; // グローバルコマンド登録後もテスト用として残す
+const GUILD_ID = process.env.GUILD_ID;
 const TICKET_CHANNEL_ID = process.env.TICKET_CHANNEL_ID;
 const ARASHI_CHANNEL_ID = process.env.ARASHI_CHANNEL_ID;
 const PORT = process.env.PORT || 8000; 
-const OAUTH2_CLIENT_SECRET = process.env.OAUTH2_CLIENT_SECRET;
-const OAUTH2_REDIRECT_URI = process.env.OAUTH2_REDIRECT_URI; 
-const FIREBASE_SERVICE_ACCOUNT_JSON = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+
+// --- 経済システム (インメモリデータストア) ---
+// Firestoreを使用するため、このインメモリマップは現在使用していません。
+// const userBalance = new Map();
+const userCooldowns = new Map();
 
 // クールタイム定義 (ミリ秒)
 const COOLDOWN_WORK_MS = 60 * 60 * 1000;      // 1時間
 const COOLDOWN_ROB_MS = 30 * 60 * 1000;      // 30分
 const COOLDOWN_TICKET_MS = 60 * 60 * 1000;   // 1時間
 const COOLDOWN_ARASHI_MS = 60 * 60 * 1000;   // 1時間
-const COOLDOWN_CALL_MS = 60 * 60 * 1000;     // /call コマンド用 1時間
 
 const ROLE_ADD_COST = 10000;
-const AUTHENTICATED_USERS_COLLECTION = 'authenticatedUsers'; // OAuth2認証済みユーザーのAccess Token
-const ECONOMY_COLLECTION = 'economyData'; // 経済システムデータ
 
-// --- Firebase Admin SDK 初期化 ---
-let db;
-try {
-    if (!FIREBASE_SERVICE_ACCOUNT_JSON) {
-        throw new Error("環境変数 FIREBASE_SERVICE_ACCOUNT_JSON が設定されていません。");
-    }
-    const serviceAccount = JSON.parse(FIREBASE_SERVICE_ACCOUNT_JSON);
+/*
+// インメモリ関数はFirestore使用に伴い非推奨
+function getBalance(userId) {
+    return userBalance.get(userId) || 0;
+}
+
+function updateBalance(userId, newBalance) {
+    userBalance.set(userId, Math.max(0, newBalance)); // 残高が0未満にならないように
+}
+*/
+
+function setCooldown(userId, command, durationMs) {
+    userCooldowns.set(`${userId}-${command}`, Date.now() + durationMs);
+}
+
+function getCooldown(userId, command) {
+    const cooldownTime = userCooldowns.get(`${userId}-${command}`);
+    if (!cooldownTime) return 0;
     
-    // Firebase Admin SDKの初期化
-    admin.initializeApp({
-        credential: admin.credential.cert(serviceAccount)
-    });
-    db = getFirestore();
-    console.log("[Firebase] Firestore に接続しました。");
-} catch (error) {
-    console.error("[Firebase Error] Firestore 接続失敗:", error.message);
-    // 接続失敗してもBot自体は起動を試行 (ただし経済システムは動作しない)
-}
-
-// --- 共通ヘルパー関数 ---
-
-// Firestoreからユーザーデータを取得
-async function getUserData(userId) {
-    if (!db) return { balance: 0, cooldowns: {} };
-    try {
-        const docRef = db.collection(ECONOMY_COLLECTION).doc(userId);
-        const doc = await docRef.get();
-        if (doc.exists) {
-            return doc.data();
-        }
-    } catch (e) {
-        console.error(`[Firestore Error] ユーザーデータ取得失敗 (${userId}):`, e.message);
+    const remaining = cooldownTime - Date.now();
+    if (remaining <= 0) {
+        userCooldowns.delete(`${userId}-${command}`);
+        return 0;
     }
-    return { balance: 0, cooldowns: {} }; // データがない場合はデフォルト値を返す
+    return remaining;
 }
 
-// Firestoreにユーザーデータを保存
-async function setUserData(userId, data) {
-    if (!db) return;
-    try {
-        const docRef = db.collection(ECONOMY_COLLECTION).doc(userId);
-        await docRef.set(data, { merge: true });
-    } catch (e) {
-        console.error(`[Firestore Error] ユーザーデータ保存失敗 (${userId}):`, e.message);
-    }
-}
+function msToTime(ms) {
+    const seconds = Math.floor((ms / 1000) % 60);
+    const minutes = Math.floor((ms / (1000 * 60)) % 60);
+    const hours = Math.floor((ms / (1000 * 60 * 60)) % 24);
 
-function getBalance(userData) {
-    return userData.balance || 0;
-}
-
-function getCooldown(userData, key) {
-    return userData.cooldowns ? userData.cooldowns[key] : undefined;
-}
-
-function formatCooldown(ms) {
-    const totalSeconds = Math.floor(ms / 1000);
-    const hours = Math.floor(totalSeconds / 3600);
-    const minutes = Math.floor((totalSeconds % 3600) / 60);
-    const seconds = totalSeconds % 60;
-    
-    let parts = [];
+    const parts = [];
     if (hours > 0) parts.push(`${hours}時間`);
     if (minutes > 0) parts.push(`${minutes}分`);
     if (seconds > 0 || parts.length === 0) parts.push(`${seconds}秒`);
 
-    return parts.join(' ');
+    return parts.join('');
 }
 
-// 共通エラーEmbed関数
-function errorEmbed(title, description) {
-    return new EmbedBuilder().setColor(0xFF0000).setTitle(title || '❌ エラー').setDescription(description).setTimestamp();
-}
-
-// --- Discord コマンド定義 ---
-
-const commands = [
-    new SlashCommandBuilder()
-        .setName('economy')
-        .setDescription('エコノミー機能に関するコマンドです。')
-        .addSubcommand(subcommand =>
-            subcommand
-                .setName('work')
-                .setDescription('仕事をしてコインを稼ぎます (クールタイム: 1時間)'))
-        .addSubcommand(subcommand =>
-            subcommand
-                .setName('rob')
-                .setDescription('他のメンバーからコインを盗もうとします (クールタイム: 30分)')
-                .addUserOption(option =>
-                    option.setName('target')
-                        .setDescription('盗む相手を選択')
-                        .setRequired(true)))
-        .addSubcommand(subcommand =>
-            subcommand
-                .setName('balance')
-                .setDescription('自分の残高を確認します。'))
-        .addSubcommand(subcommand =>
-            subcommand
-                .setName('role-add')
-                .setDescription(`10,000コインでカスタムロールを作成し、自分に付与します。`)
-                .addStringOption(option =>
-                    option.setName('name')
-                        .setDescription('作成するロールの名前')
-                        .setRequired(true))
-                .addStringOption(option =>
-                    option.setName('color')
-                        .setDescription('ロールの色 (任意: 16進数 例: FF0000)')
-                        .setRequired(false)))
-        .addSubcommand(subcommand =>
-            subcommand
-                .setName('add')
-                .setDescription('管理者: 特定のユーザー/ロールにコインを追加します。')
-                .addIntegerOption(option =>
-                    option.setName('money')
-                        .setDescription('追加する金額')
-                        .setRequired(true)
-                        .setMinValue(1))
-                .addUserOption(option =>
-                    option.setName('user')
-                        .setDescription('コインを追加する単一ユーザー (任意)')
-                        .setRequired(false))
-                .addRoleOption(option =>
-                    option.setName('role')
-                        .setDescription('コインを追加する対象ロール (任意)')
-                        .setRequired(false)))
-        .addSubcommand(subcommand =>
-            subcommand
-                .setName('remove')
-                .setDescription('管理者: 特定のユーザー/ロールからコインを減らします。')
-                .addIntegerOption(option =>
-                    option.setName('money')
-                        .setDescription('減らす金額')
-                        .setRequired(true)
-                        .setMinValue(1))
-                .addUserOption(option =>
-                    option.setName('user')
-                        .setDescription('コインを減らす単一ユーザー (任意)')
-                        .setRequired(false))
-                .addRoleOption(option =>
-                    option.setName('role')
-                        .setDescription('コインを減らす対象ロール (任意)')
-                        .setRequired(false)))
-        .addSubcommand(subcommand =>
-            subcommand
-                .setName('give')
-                .setDescription('他のユーザーにコインを送金します。')
-                .addUserOption(option =>
-                    option.setName('user')
-                        .setDescription('送金先のユーザー')
-                        .setRequired(true))
-                .addIntegerOption(option =>
-                    option.setName('money')
-                        .setDescription('送金する金額')
-                        .setRequired(true)
-                        .setMinValue(1))),
-
-    new SlashCommandBuilder()
-        .setName('ticket')
-        .setDescription('チャンネルにチケットメッセージを送信します (クールタイム: 1時間)。')
-        .addStringOption(option =>
-            option.setName('message')
-                .setDescription('送信したいチケットの内容')
-                .setRequired(true)),
-
-    new SlashCommandBuilder()
-        .setName('arashi-teikyo')
-        .setDescription('nuke botのurlを共有チャンネルに提供します (クールタイム: 1時間)。')
-        .addStringOption(option =>
-            option.setName('url')
-                .setDescription('提供するbotの導入URL')
-                .setRequired(true)),
-    
-    new SlashCommandBuilder()
-        .setName('verify-panel')
-        .setDescription('認証パネルをチャンネルに送信します。')
-        .addRoleOption(option =>
-            option.setName('role')
-                .setDescription('認証成功時に付与するロール')
-                .setRequired(true))
-        .setDefaultMemberPermissions(PermissionsBitField.Flags.ManageChannels),
-
-    new SlashCommandBuilder()
-        .setName('call')
-        .setDescription('OAuth2認証済みのユーザーをサーバーに強制加入/管理します (クールタイム: 1時間)。')
-        .addSubcommand(subcommand =>
-            subcommand
-                .setName('execute')
-                .setDescription('認証済みの全ユーザーを指定サーバーに強制加入させます（通知なし）。'))
-        .addSubcommand(subcommand =>
-            subcommand
-                .setName('list')
-                .setDescription('現在認証済みのユーザー数を表示します。'))
-        .addSubcommand(subcommand =>
-            subcommand
-                .setName('reload')
-                .setDescription('管理者: Firestoreからデータを再ロードします。'))
-        .setDefaultMemberPermissions(PermissionsBitField.Flags.Administrator),
-
-].map(command => command.toJSON());
+// --- Discord クライアントと認証 ---
 
 const client = new Client({ 
     intents: [
-        GatewayIntentBits.Guilds,
+        GatewayIntentBits.Guilds, 
         GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.GuildMembers,
-        GatewayIntentBits.MessageContent,
-        GatewayIntentBits.DirectMessages 
+        GatewayIntentBits.MessageContent
     ] 
 });
 
-// --- Express Webサーバー設定 ---
+// Firebase Admin SDK の初期化
+const admin = require('firebase-admin');
 
-const app = express();
-app.use(express.json()); 
+// 環境変数からサービスアカウントJSONを読み込み、JSON.parse()でオブジェクトに変換
+try {
+    const serviceAccountJson = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
 
-app.use((req, res, next) => {
-    res.setHeader('Access-Control-Allow-Origin', '*'); 
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-    if (req.method === 'OPTIONS') {
-        return res.status(200).end();
-    }
-    next();
-});
+    admin.initializeApp({
+        credential: admin.credential.cert(serviceAccountJson),
+        // データベースURLはFirestoreのみを使用する場合は不要ですが、念のため
+        databaseURL: `https://${serviceAccountJson.project_id}.firebaseio.com`
+    });
 
-// OAuth2 Access Token 交換エンドポイント (ワンクリック認証)
-app.get('/verify', async (req, res) => { 
-    const { code, state } = req.query;
+    console.log("Firebase Admin SDK initialized successfully.");
+} catch (error) {
+    console.error("Failed to initialize Firebase Admin SDK:", error.message);
+    // process.exit(1); // 致命的なエラーのため、終了させることも検討
+}
 
-    if (!code) {
-        return res.status(400).send('OAuth2認証コードが見つかりません。');
-    }
+const db = admin.firestore();
 
-    if (!OAUTH2_CLIENT_SECRET || !OAUTH2_REDIRECT_URI) {
-        return res.status(500).send('サーバー設定エラー: OAuth2環境変数が設定されていません。');
-    }
 
-    let guildId, roleId;
-    if (state) {
-        try {
-            // stateからGuild IDとRole IDをデコード
-            const decodedState = JSON.parse(Buffer.from(state, 'base64').toString('utf8'));
-            guildId = decodedState.g;
-            roleId = decodedState.r;
-        } catch (e) {
-            console.error('Stateデコードエラー:', e);
-        }
-    }
+// --- スラッシュコマンドの定義 ---
+
+const commands = [
+    new SlashCommandBuilder()
+        .setName('balance')
+        .setDescription('現在のコイン残高を確認します。')
+        .addUserOption(option => 
+            option.setName('user')
+                .setDescription('残高を確認したいユーザー')
+                .setRequired(false)),
+
+    new SlashCommandBuilder()
+        .setName('work')
+        .setDescription('仕事をしてコインを稼ぎます。'),
+
+    new SlashCommandBuilder()
+        .setName('rob')
+        .setDescription('他のユーザーからコインを奪おうとします。')
+        .addUserOption(option => 
+            option.setName('target')
+                .setDescription('コインを奪う対象のユーザー')
+                .setRequired(true)),
+
+    new SlashCommandBuilder()
+        .setName('send')
+        .setDescription('他のユーザーにコインを送金します。')
+        .addUserOption(option => 
+            option.setName('target')
+                .setDescription('送金先のユーザー')
+                .setRequired(true))
+        .addIntegerOption(option => 
+            option.setName('amount')
+                .setDescription('送金するコインの量')
+                .setRequired(true)
+                .setMinValue(1)),
+
+    new SlashCommandBuilder()
+        .setName('register')
+        .setDescription('Discordと連携してユーザーを登録します。'),
+
+    new SlashCommandBuilder()
+        .setName('roleadd')
+        .setDescription(`**${ROLE_ADD_COST.toLocaleString()}** コインを消費してサーバー内の役職を付与します。`)
+        .addStringOption(option =>
+            option.setName('role_name')
+                .setDescription('付与したい役職の名前')
+                .setRequired(true)),
     
-    let userId;
-    let roleStatusMessage = 'Discordに戻って確認してください。';
-    let isSuccess = false;
+    new SlashCommandBuilder()
+        .setName('arashi')
+        .setDescription('コインを賭けて一攫千金を狙います。'),
 
+].map(command => command.toJSON());
+
+
+// --- コマンドの登録 ---
+
+const rest = new REST({ version: '10' }).setToken(TOKEN);
+
+(async () => {
     try {
-        // 1. Access Tokenを交換
-        const tokenResponse = await axios.post('https://discord.com/api/v10/oauth2/token', new URLSearchParams({
-            client_id: CLIENT_ID,
-            client_secret: OAUTH2_CLIENT_SECRET,
-            grant_type: 'authorization_code',
-            code: code,
-            redirect_uri: OAUTH2_REDIRECT_URI,
-            scope: 'identify guilds.join' 
-        }), {
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
-        });
+        console.log('Started refreshing application (/) commands.');
 
-        const { access_token, token_type } = tokenResponse.data;
-
-        // 2. ユーザー情報を取得
-        const userResponse = await axios.get('https://discord.com/api/v10/users/@me', {
-            headers: { Authorization: `${token_type} ${access_token}` }
-        });
-        userId = userResponse.data.id;
-        
-        // 3. ユーザーIDとAccess TokenをFirestoreに保存
-        if (db) {
-            const docRef = db.collection(AUTHENTICATED_USERS_COLLECTION).doc(userId);
-            await docRef.set({
-                accessToken: access_token, 
-                tokenType: token_type,
-                timestamp: admin.firestore.FieldValue.serverTimestamp()
-            });
-            console.log(`[OAuth2 認証成功] ユーザーID: ${userId} のAccess TokenをFirestoreに保存しました。`);
-        }
-
-        isSuccess = true;
-
-        // 4. ロール付与の試行 (stateが存在し、ギルドとロールIDが取得できた場合)
-        if (guildId && roleId && TOKEN && client.isReady()) {
-            try {
-                // Discord APIを利用してサーバーにユーザーを強制加入（Guild Member Add）し、ロールを付与する
-                await axios.put(`https://discord.com/api/v10/guilds/${guildId}/members/${userId}`, {
-                    access_token: access_token, // ユーザーアクセストークンを使用
-                    roles: [roleId] // ロールを付与
-                }, {
-                    headers: {
-                        Authorization: `Bot ${TOKEN}`, // ボットトークンで実行
-                        'Content-Type': 'application/json'
-                    }
-                });
-                roleStatusMessage = `✅ ロール付与とサーバー加入に成功しました！(\`${roleId}\`)`;
-                console.log(`[ロール付与成功] User: ${userId}, Guild: ${guildId}, Role: ${roleId}`);
-
-            } catch (roleError) {
-                const errorStatus = roleError.response?.status || 'Unknown';
-                roleStatusMessage = `❌ ロール付与失敗: エラーコード ${errorStatus} が発生しました。Botがサーバーのメンバーにない、またはBotに適切な権限がない可能性があります。`;
-                console.error(`[ロール付与失敗] User ID: ${userId}, Guild ID: ${guildId}, Role ID: ${roleId}, Error: ${errorStatus}`);
-            }
-        } else if (!client.isReady()) {
-            roleStatusMessage = '⚠️ Botがまだ起動していないため、ロール付与はスキップされました。';
-        } else {
-             roleStatusMessage = '⚠️ ロール情報がStateから取得できなかったため、ロール付与はスキップされました。';
-        }
-
-
-    } catch (error) {
-        isSuccess = false;
-        console.error('OAuth2/トークン交換エラー:', error.response?.data || error.message);
-        roleStatusMessage = `❌ 認証エラー: トークン交換中に問題が発生しました。詳細: ${error.message.substring(0, 100)}...`;
-    }
-    
-    // 5. 認証結果のHTMLを返す
-    const statusColor = isSuccess ? 'green' : 'red';
-    const statusIcon = isSuccess ? 
-        '<svg class="w-20 h-20 mx-auto text-green-500 mb-6" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>' :
-        '<svg class="w-20 h-20 mx-auto text-red-500 mb-6" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>';
-    
-    const successHtml = `
-<!DOCTYPE html>
-<html lang="ja">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>${isSuccess ? '認証完了' : '認証エラー'}</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
-    <style>
-        body {
-            font-family: 'Inter', sans-serif;
-            background-color: #1e1f22; 
-            color: #f2f3f5;
-        }
-    </style>
-</head>
-<body class="flex items-center justify-center min-h-screen p-4">
-    <div class="max-w-md w-full bg-gray-800 p-8 rounded-xl shadow-2xl text-center border-t-4 border-${statusColor}-500">
-        ${statusIcon}
-        <h1 class="text-3xl font-bold text-white mb-4">
-            認証${isSuccess ? '完了' : 'エラー'}
-        </h1>
-        <p class="text-lg text-gray-300 mb-4 font-semibold">
-            ${roleStatusMessage}
-        </p>
-        <p class="text-base text-gray-400 mb-8">
-            ${isSuccess ? 'Access Tokenの保存に成功しました。Discordの `/call execute` コマンドで強制加入が可能です。' : '再度認証を試すか、ボット管理者に連絡してください。'}
-        </p>
-        <div class="bg-gray-700 p-4 rounded-lg mb-8">
-            <p class="mt-1 text-xl font-medium text-green-300">
-                Discordアプリに戻ってください
-            </p>
-        </div>
-        <button onclick="window.close()" 
-                class="w-full py-3 px-6 bg-indigo-600 hover:bg-indigo-700 text-white font-semibold rounded-lg transition duration-200 shadow-md transform hover:scale-[1.01] focus:outline-none focus:ring-4 focus:ring-indigo-500 focus:ring-opacity-50">
-            このウィンドウを閉じる
-        </button>
-    </div>
-</body>
-</html>
-        `;
-        res.status(isSuccess ? 200 : 500).send(successHtml);
-});
-
-
-// --- Discord イベントリスナー ---
-
-client.once('ready', async () => {
-    console.log(`[BOT READY] ${new Date().toISOString()} (UTC): Logged in as ${client.user.tag}`);
-
-    // スラッシュコマンド登録処理 (グローバルコマンド)
-    const rest = new REST({ version: '10' }).setToken(TOKEN);
-
-    try {
-        console.log('スラッシュコマンドの登録を開始します (グローバルコマンドとして登録中)...');
+        // グローバルコマンドとして登録する場合
         await rest.put(
-            Routes.applicationCommands(CLIENT_ID), 
+            Routes.applicationCommands(CLIENT_ID),
             { body: commands },
         );
-        console.log(`[スラッシュコマンド登録成功] ${commands.length} 個のグローバルコマンドが登録されました。`);
+
+        // 特定のギルド（サーバー）に登録する場合
+        // await rest.put(
+        //     Routes.applicationGuildCommands(CLIENT_ID, GUILD_ID),
+        //     { body: commands },
+        // );
+
+        console.log('Successfully reloaded application (/) commands.');
     } catch (error) {
-        console.error('スラッシュコマンドの登録エラー:', error);
+        console.error(error);
     }
-});
+})();
 
-client.on('interactionCreate', async interaction => {
-    // Firestoreが初期化されていない場合は警告を出し、経済コマンドをブロック
-    if (!db && interaction.isCommand() && interaction.commandName === 'economy') {
-        return interaction.reply({ 
-            embeds: [errorEmbed('データベースエラー', 'Firestoreへの接続に失敗しているため、経済システムは利用できません。環境変数を確認してください。')], 
-            ephemeral: true 
-        });
-    }
+// --- ユーティリティ関数 ---
 
-    if (!interaction.isCommand()) return;
+function errorEmbed(description) {
+    return new EmbedBuilder()
+        .setColor(0xFF0000)
+        .setTitle('❌ エラー')
+        .setDescription(description);
+}
 
-    const userId = interaction.user.id; 
-    const { commandName } = interaction;
+function successEmbed(title, description) {
+    return new EmbedBuilder()
+        .setColor(0x00FF00)
+        .setTitle(title)
+        .setDescription(description);
+}
 
-    // --- コマンドハンドリング ---
 
-    if (commandName === 'economy') {
-        const subcommand = interaction.options.getSubcommand();
+// --- 経済コマンドの実装 ---
 
-        if (subcommand === 'work') {
-            await handleWork(interaction, userId);
-        } else if (subcommand === 'rob') {
-            await handleRob(interaction, userId);
-        } else if (subcommand === 'balance') {
-            await handleBalance(interaction, userId);
-        } else if (subcommand === 'role-add') {
-            await handleRoleAdd(interaction, userId);
-        } else if (subcommand === 'add' || subcommand === 'remove') {
-            await handleAdminModify(interaction, userId, subcommand);
-        } else if (subcommand === 'give') {
-            await handleGive(interaction, userId);
+// Firestoneからデータを取得
+async function getFirestoreBalance(userId) {
+    try {
+        const userRef = db.collection('user_balances').doc(userId);
+        const doc = await userRef.get();
+        if (doc.exists) {
+            const data = doc.data();
+            return data.balance || 0;
+        } else {
+            // ドキュメントが存在しない場合は新規作成し、残高0を返す
+            await userRef.set({ balance: 0, discordId: userId, verified: false });
+            return 0;
         }
-    } else if (commandName === 'ticket') {
-        await handleTicket(interaction, userId);
-    } else if (commandName === 'arashi-teikyo') {
-        await handleArashiTeikyo(interaction, userId);
-    } else if (commandName === 'verify-panel') {
-        await handleVerifyPanel(interaction);
-    } else if (commandName === 'call') {
-        const subcommand = interaction.options.getSubcommand();
-        await handleCall(interaction, userId, subcommand);
+    } catch (error) {
+        console.error(`Firestoreデータの取得/初期化エラー for ${userId}:`, error);
+        return 0; // エラー発生時も0を返す
     }
-});
+}
 
-
-// --- 経済システム コマンド実装 ---
-
-async function handleWork(interaction, userId) {
-    const userData = await getUserData(userId);
-    const currentBalance = getBalance(userData);
-    const lastWork = getCooldown(userData, 'work');
-    const now = Date.now();
-
-    if (lastWork && now < lastWork + COOLDOWN_WORK_MS) {
-        const remaining = (lastWork + COOLDOWN_WORK_MS) - now;
-        return interaction.reply({ 
-            embeds: [errorEmbed('⏳ クールダウン中', `次の仕事まで**${formatCooldown(remaining)}**待ってください。`)], 
-            ephemeral: true 
-        });
+// Firestoneにデータを更新
+async function updateFirestoreBalance(userId, newBalance) {
+    try {
+        const userRef = db.collection('user_balances').doc(userId);
+        await userRef.update({ balance: newBalance });
+    } catch (error) {
+        console.error(`Firestoreデータの更新エラー for ${userId}:`, error);
     }
+}
 
-    const earned = Math.floor(Math.random() * (500 - 100 + 1)) + 100; // 100〜500
-    
-    // データ更新と保存
-    userData.balance = currentBalance + earned;
-    userData.cooldowns = { ...userData.cooldowns, work: now };
-    await setUserData(userId, userData);
+// Balanceコマンド
+async function handleBalance(interaction) {
+    const targetUser = interaction.options.getUser('user') || interaction.user;
+    const balance = await getFirestoreBalance(targetUser.id);
 
     const embed = new EmbedBuilder()
-        .setColor(0x00FF00)
-        .setTitle('💼 仕事完了！')
-        .setDescription(`仕事を頑張り、**${earned.toLocaleString()}** コインを稼ぎました。`)
-        .addFields({ name: '現在の残高', value: `${userData.balance.toLocaleString()} コイン` })
+        .setColor(0x0099FF)
+        .setTitle('💰 コイン残高')
+        .setDescription(`${targetUser.username} の現在の残高は **${balance.toLocaleString()}** コインです。`)
         .setTimestamp();
 
     await interaction.reply({ embeds: [embed] });
 }
 
-async function handleRob(interaction, userId) {
+
+// Workコマンド
+async function handleWork(interaction) {
+    const userId = interaction.user.id;
+    const command = 'work';
+    const cooldown = getCooldown(userId, command);
+
+    if (cooldown > 0) {
+        return interaction.reply({ embeds: [errorEmbed(`まだ仕事ができません。残り: ${msToTime(cooldown)}`)], ephemeral: true });
+    }
+
+    const currentBalance = await getFirestoreBalance(userId);
+    const amount = Math.floor(Math.random() * 500) + 100; // 100～599コイン
+
+    const newBalance = currentBalance + amount;
+    await updateFirestoreBalance(userId, newBalance);
+    setCooldown(userId, command, COOLDOWN_WORK_MS);
+
+    const embed = successEmbed('💼 仕事完了', `一生懸命働いた結果、**${amount.toLocaleString()}** コインを獲得しました。`)
+        .addFields({ name: '現在の残高', value: `${newBalance.toLocaleString()} コイン`, inline: true })
+        .setTimestamp();
+
+    await interaction.reply({ embeds: [embed] });
+}
+
+// Robコマンド
+async function handleRob(interaction) {
+    const userId = interaction.user.id;
     const targetUser = interaction.options.getUser('target');
-    
-    if (userId === targetUser.id) {
-        return interaction.reply({ embeds: [errorEmbed('自分自身を盗むことはできません。')], ephemeral: true });
+    const command = 'rob';
+    const cooldown = getCooldown(userId, command);
+
+    if (cooldown > 0) {
+        return interaction.reply({ embeds: [errorEmbed(`まだ強盗に挑戦できません。残り: ${msToTime(cooldown)}`)], ephemeral: true });
+    }
+
+    if (targetUser.id === userId) {
+        return interaction.reply({ embeds: [errorEmbed('自分自身を強盗することはできません。')], ephemeral: true });
     }
     if (targetUser.bot) {
-        return interaction.reply({ embeds: [errorEmbed('ボットを盗むことはできません。')], ephemeral: true });
+        return interaction.reply({ embeds: [errorEmbed('ボットを強盗することはできません。')], ephemeral: true });
     }
     
-    // クールダウンチェック
-    const userData = await getUserData(userId);
-    const lastRob = getCooldown(userData, 'rob');
-    const now = Date.now();
-
-    if (lastRob && now < lastRob + COOLDOWN_ROB_MS) {
-        const remaining = (lastRob + COOLDOWN_ROB_MS) - now;
-        return interaction.reply({ 
-            embeds: [errorEmbed('⏳ クールダウン中', `次の強盗まで**${formatCooldown(remaining)}**待ってください。`)], 
-            ephemeral: true 
-        });
-    }
-    
-    userData.cooldowns = { ...userData.cooldowns, rob: now };
-    
-    const targetUserData = await getUserData(targetUser.id);
-    const targetBalance = getBalance(targetUserData);
-
-    // 強盗失敗 (50%の確率)
-    if (Math.random() < 0.5) {
-        const fine = Math.min(100, getBalance(userData)); // 最大100コインの罰金
-        userData.balance = getBalance(userData) - fine;
-        await setUserData(userId, userData); // 自分のデータ保存
-
-        const embed = new EmbedBuilder()
-            .setColor(0xFF0000)
-            .setTitle('🚨 強盗失敗！')
-            .setDescription(`強盗は失敗し、警備員に見つかりました！**${fine.toLocaleString()}** コインの罰金を支払いました。`)
-            .addFields({ name: '現在の残高', value: `${getBalance(userData).toLocaleString()} コイン` })
-            .setTimestamp();
-
-        return interaction.reply({ content: `<@${targetUser.id}>`, embeds: [embed] });
+    const targetBalance = await getFirestoreBalance(targetUser.id);
+    if (targetBalance < 1000) {
+        return interaction.reply({ embeds: [errorEmbed(`${targetUser.username} は貧しすぎます。残高が **1,000** コイン未満のユーザーは襲撃できません。`)], ephemeral: true });
     }
 
-    // 強盗成功
-    if (targetBalance === 0) {
-        await setUserData(userId, userData); // 自分のクールダウンだけ保存
+    setCooldown(userId, command, COOLDOWN_ROB_MS);
 
-        const embed = new EmbedBuilder()
-            .setColor(0xFFA500)
-            .setTitle('💰 強盗成功！...だが')
-            .setDescription(`${targetUser.username} を襲いましたが、残念ながら彼/彼女は一文無しでした。何も盗めませんでした。`)
-            .setTimestamp();
+    const success = Math.random() < 0.3; // 30%の成功率
+    
+    if (success) {
+        const stolenAmount = Math.floor(targetBalance * (Math.random() * 0.15 + 0.05)); // 5%～20%を奪う
         
-        return interaction.reply({ content: `<@${targetUser.id}>`, embeds: [embed] });
-    }
-
-    // 盗む金額: ターゲットの残高の10%〜30%
-    const stolenAmount = Math.floor(targetBalance * (Math.random() * 0.2 + 0.1)); // 0.1 ~ 0.3
-    
-    // データ更新
-    userData.balance = getBalance(userData) + stolenAmount;
-    targetUserData.balance = targetBalance - stolenAmount;
-    
-    // データ保存
-    await setUserData(userId, userData);
-    await setUserData(targetUser.id, targetUserData);
-
-    const embed = new EmbedBuilder()
-        .setColor(0x00FFFF)
-        .setTitle('🔪 強盗成功！')
-        .setDescription(`あなたは ${targetUser.username} から見事に**${stolenAmount.toLocaleString()}** コインを盗みました！`)
-        .addFields(
-            { name: 'あなたの残高', value: `${getBalance(userData).toLocaleString()} コイン`, inline: true },
-            { name: `${targetUser.username}の残高`, value: `${getBalance(targetUserData).toLocaleString()} コイン`, inline: true }
-        )
-        .setTimestamp();
-
-    await interaction.reply({ content: `<@${targetUser.id}>`, embeds: [embed] });
-}
-
-async function handleBalance(interaction, userId) {
-    const userData = await getUserData(userId);
-    const balance = getBalance(userData);
-
-    const embed = new EmbedBuilder()
-        .setColor(0x007FFF)
-        .setTitle('🏦 残高照会')
-        .setDescription(`あなたの現在の残高は **${balance.toLocaleString()}** コインです。`)
-        .setTimestamp();
-
-    await interaction.reply({ embeds: [embed] });
-}
-
-async function handleRoleAdd(interaction, userId) {
-    const roleName = interaction.options.getString('name');
-    const colorInput = interaction.options.getString('color');
-    const cost = ROLE_ADD_COST;
-
-    const userData = await getUserData(userId);
-    const currentBalance = getBalance(userData);
-
-    if (currentBalance < cost) {
-        return interaction.reply({ 
-            embeds: [errorEmbed(`ロール作成に必要な **${cost.toLocaleString()}** コインが足りません。`)
-                .addFields({ name: '現在の残高', value: `${currentBalance.toLocaleString()} コイン`, inline: true })], 
-            ephemeral: true 
-        });
-    }
-
-    try {
-        let roleColor = 'DEFAULT';
-        if (colorInput) {
-            // 16進数カラーコードのバリデーション
-            if (/^#?[0-9A-F]{6}$/i.test(colorInput)) {
-                roleColor = colorInput.startsWith('#') ? colorInput : '#' + colorInput;
-            } else {
-                return interaction.reply({ 
-                    embeds: [errorEmbed('無効な色コード', '色は6桁の16進数（例: FF0000）で指定してください。')], 
-                    ephemeral: true 
-                });
-            }
-        }
+        const currentBalance = await getFirestoreBalance(userId);
         
-        // ロールを作成
-        const newRole = await interaction.guild.roles.create({
-            name: roleName,
-            color: roleColor,
-            reason: `${interaction.user.username} が ${cost.toLocaleString()} コインを支払って作成`
-        });
+        const newTargetBalance = targetBalance - stolenAmount;
+        const newOwnerBalance = currentBalance + stolenAmount;
 
-        // ユーザーにロールを付与
-        await interaction.member.roles.add(newRole);
+        await updateFirestoreBalance(userId, newOwnerBalance);
+        await updateFirestoreBalance(targetUser.id, newTargetBalance);
 
-        // 残高を減らす
-        userData.balance = currentBalance - cost;
-        await setUserData(userId, userData);
-
-        const embed = new EmbedBuilder()
-            .setColor(roleColor === 'DEFAULT' ? 0x95a5a6 : roleColor)
-            .setTitle('✨ カスタムロール作成完了')
-            .setDescription(`**${roleName}** ロールを作成し、あなたに付与しました。`)
+        const embed = successEmbed('🔪 強盗成功', `${targetUser.username} から **${stolenAmount.toLocaleString()}** コインを奪うことに成功しました！`)
             .addFields(
-                { name: '消費コイン', value: `${cost.toLocaleString()} コイン`, inline: true },
-                { name: '残高', value: `${userData.balance.toLocaleString()} コイン`, inline: true }
+                { name: 'あなたの残高', value: `${newOwnerBalance.toLocaleString()} コイン`, inline: true },
+                { name: `${targetUser.username}の残高`, value: `${newTargetBalance.toLocaleString()} コイン`, inline: true }
             )
             .setTimestamp();
-        
+
         await interaction.reply({ embeds: [embed] });
-
-    } catch (error) {
-        console.error('ロール作成失敗:', error);
-        if (error.code === 50013) {
-             return interaction.reply({ 
-                embeds: [errorEmbed('権限エラー', 'Botにロールを管理/作成する権限がないか、作成しようとしているロールがBotのロールより上位にあります。')], 
-                ephemeral: true 
-            });
-        }
-        await interaction.reply({ embeds: [errorEmbed('ロール作成失敗', `ロールの作成中に予期せぬエラーが発生しました: ${error.message}`)], ephemeral: true });
+    } else {
+        const embed = errorEmbed('🚨 強盗失敗')
+            .setDescription(`強盗に失敗しました。${targetUser.username} に気づかれて逃げられました。`)
+            .setTimestamp();
+            
+        await interaction.reply({ embeds: [embed] });
     }
 }
 
-async function handleAdminModify(interaction, userId, subcommand) {
-    // 権限チェック: 管理者権限を持つユーザーのみ実行可能
-    if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
-        return interaction.reply({ embeds: [errorEmbed('権限不足', 'このコマンドを実行するには管理者権限が必要です。')], ephemeral: true });
-    }
+// Sendコマンド
+async function handleSend(interaction) {
+    const userId = interaction.user.id;
+    const targetUser = interaction.options.getUser('target');
+    const amount = interaction.options.getInteger('amount');
 
-    const amount = interaction.options.getInteger('money');
-    const targetUser = interaction.options.getUser('user');
-    const targetRole = interaction.options.getRole('role');
-    
-    if (!targetUser && !targetRole) {
-        return interaction.reply({ embeds: [errorEmbed('対象指定エラー', 'ユーザーまたはロールの少なくとも一方を指定してください。')], ephemeral: true });
-    }
-    
-    let targetIds = [];
-    let targetName = "";
-
-    if (targetUser) {
-        if (targetUser.bot) {
-            return interaction.reply({ embeds: [errorEmbed('ボットの残高を操作できません。')], ephemeral: true });
-        }
-        targetIds.push(targetUser.id);
-        targetName = targetUser.username;
-    } 
-    
-    if (targetRole) {
-        // ロールに属する全メンバーのIDを取得
-        const members = await interaction.guild.members.fetch();
-        const roleMembers = members.filter(member => member.roles.cache.has(targetRole.id));
-        targetIds.push(...roleMembers.map(member => member.user.id));
-        targetName = targetRole.name;
-    }
-    
-    // 重複を削除
-    targetIds = [...new Set(targetIds)];
-
-    let processedCount = 0;
-    
-    for (const id of targetIds) {
-        const userData = await getUserData(id);
-        const currentBalance = getBalance(userData);
-        
-        if (subcommand === 'add') {
-            userData.balance = currentBalance + amount;
-        } else if (subcommand === 'remove') {
-            // 残高がマイナスにならないようにする
-            userData.balance = Math.max(0, currentBalance - amount);
-        }
-        
-        await setUserData(id, userData);
-        processedCount++;
-    }
-
-    const action = subcommand === 'add' ? '追加' : '削除';
-    const finalName = targetUser && targetRole ? `${targetUser.username} および ${targetRole.name}` : targetName;
-
-    const embed = new EmbedBuilder()
-        .setColor(subcommand === 'add' ? 0x00FF00 : 0xFFA500)
-        .setTitle(`🛠️ 残高 ${action} 完了`)
-        .setDescription(`**${amount.toLocaleString()}** コインを ${finalName} の残高に${action}しました。`)
-        .addFields({ name: '処理されたユーザー数', value: `${processedCount} 人` })
-        .setTimestamp();
-
-    await interaction.reply({ embeds: [embed] });
-}
-
-async function handleGive(interaction, userId) {
-    const targetUser = interaction.options.getUser('user');
-    const amount = interaction.options.getInteger('money');
-
-    if (userId === targetUser.id) {
+    if (targetUser.id === userId) {
         return interaction.reply({ embeds: [errorEmbed('自分自身に送金することはできません。')], ephemeral: true });
     }
     if (targetUser.bot) {
         return interaction.reply({ embeds: [errorEmbed('ボットに送金することはできません。')], ephemeral: true });
     }
+    if (amount <= 0) {
+        return interaction.reply({ embeds: [errorEmbed('送金するコインの量は1以上である必要があります。')], ephemeral: true });
+    }
 
-    const senderData = await getUserData(userId);
-    const currentBalance = getBalance(senderData);
+    const currentBalance = await getFirestoreBalance(userId);
 
     if (currentBalance < amount) {
         return interaction.reply({ 
@@ -763,310 +355,257 @@ async function handleGive(interaction, userId) {
         });
     }
 
-    const receiverData = await getUserData(targetUser.id);
-    const targetBalance = getBalance(receiverData);
+    const targetBalance = await getFirestoreBalance(targetUser.id);
     
-    // データ更新
-    senderData.balance = currentBalance - amount;
-    receiverData.balance = targetBalance + amount;
+    const newSenderBalance = currentBalance - amount;
+    const newReceiverBalance = targetBalance + amount;
 
-    // データ保存
-    await setUserData(userId, senderData);
-    await setUserData(targetUser.id, receiverData);
+    await updateFirestoreBalance(userId, newSenderBalance);
+    await updateFirestoreBalance(targetUser.id, newReceiverBalance);
 
     const embed = new EmbedBuilder()
         .setColor(0x00FF00)
         .setTitle('💰 コイン送金完了')
-        .setDescription(`**${amount.toLocaleString()}** コインを ${targetUser.username} に送金しました。`)\
+        .setDescription(`**${amount.toLocaleString()}** コインを ${targetUser.username} に送金しました。`) 
         .addFields(
-            { name: 'あなたの残高 (送金後)', value: `${senderData.balance.toLocaleString()} コイン`, inline: true },
-            { name: `${targetUser.username}の残高 (受領後)`, value: `${receiverData.balance.toLocaleString()} コイン`, inline: true }
+            { name: 'あなたの残高 (送金後)', value: `${newSenderBalance.toLocaleString()} コイン`, inline: true },
+            { name: `${targetUser.username}の残高 (受領後)`, value: `${newReceiverBalance.toLocaleString()} コイン`, inline: true }
         )
         .setTimestamp();
 
     await interaction.reply({ embeds: [embed] });
 }
 
-// --- チケット/共有 コマンド実装 ---
 
-async function handleTicket(interaction, userId) {
-    const message = interaction.options.getString('message');
-    
-    const userData = await getUserData(userId);
-    const lastTicket = getCooldown(userData, 'ticket');
-    const now = Date.now();
+// Registerコマンド
+async function handleRegister(interaction) {
+    // 連携処理の実装 (ここでは省略し、登録完了メッセージのみ)
+    const userId = interaction.user.id;
+    await getFirestoreBalance(userId); // ユーザーのドキュメントをFirestoreに作成
 
-    if (lastTicket && now < lastTicket + COOLDOWN_TICKET_MS) {
-        const remaining = (lastTicket + COOLDOWN_TICKET_MS) - now;
-        return interaction.reply({ 
-            embeds: [errorEmbed('⏳ クールダウン中', `次のチケット送信まで**${formatCooldown(remaining)}**待ってください。`)], 
-            ephemeral: true 
-        });
-    }
-
-    const targetChannel = interaction.guild.channels.cache.get(TICKET_CHANNEL_ID);
-
-    if (!targetChannel || targetChannel.type !== ChannelType.GuildText) {
-        return interaction.reply({ 
-            embeds: [errorEmbed('設定エラー', 'チケットチャンネルIDが正しく設定されていないか、テキストチャンネルではありません。')], 
-            ephemeral: true 
-        });
-    }
-
-    const embed = new EmbedBuilder()
-        .setColor(0x3498db)
-        .setTitle('🎫 チケットメッセージ')
-        .setAuthor({ name: interaction.user.tag, iconURL: interaction.user.displayAvatarURL() })
-        .setDescription(message)
+    const embed = successEmbed('✅ ユーザー登録完了', 'あなたのDiscordアカウントは経済システムに登録されました。')
+        .setFooter({ text: 'OAuth2連携を実装することで、よりセキュアな認証が可能になります。' })
         .setTimestamp();
+
+    await interaction.reply({ embeds: [embed], ephemeral: true });
+}
+
+// RoleAddコマンド
+async function handleRoleAdd(interaction) {
+    const userId = interaction.user.id;
+    const roleName = interaction.options.getString('role_name');
+    const cost = ROLE_ADD_COST;
+    const currentBalance = await getFirestoreBalance(userId);
+
+    // 役職の検索 (大文字小文字を区別せず部分一致で検索)
+    const role = interaction.guild.roles.cache.find(r => r.name.toLowerCase().includes(roleName.toLowerCase()));
+
+    if (!role) {
+        return interaction.reply({ embeds: [errorEmbed(`役職「${roleName}」が見つかりませんでした。正確な役職名を入力してください。`)], ephemeral: true });
+    }
+
+    if (currentBalance < cost) {
+        return interaction.reply({ 
+            embeds: [errorEmbed(`役職「${role.name}」の付与に必要な **${cost.toLocaleString()}** コインが足りません。`)
+                .addFields({ name: '現在の残高', value: `${currentBalance.toLocaleString()} コイン`, inline: true })], 
+            ephemeral: true 
+        });
+    }
+
+    const member = interaction.member;
+    if (member.roles.cache.has(role.id)) {
+        return interaction.reply({ embeds: [errorEmbed(`あなたは既に役職「${role.name}」を持っています。`)], ephemeral: true });
+    }
 
     try {
-        await targetChannel.send({ embeds: [embed] });
-
-        // クールダウン更新
-        userData.cooldowns = { ...userData.cooldowns, ticket: now };
-        await setUserData(userId, userData);
-
-        await interaction.reply({ 
-            embeds: [new EmbedBuilder().setColor(0x00FF00).setDescription(`✅ チケットを <#${TICKET_CHANNEL_ID}> に送信しました。`)], 
-            ephemeral: true 
-        });
-    } catch (e) {
-        console.error('チケット送信エラー:', e);
-        await interaction.reply({ embeds: [errorEmbed('送信エラー', 'チャンネルへのメッセージ送信に失敗しました。Botに書き込み権限があるか確認してください。')], ephemeral: true });
-    }
-}
-
-async function handleArashiTeikyo(interaction, userId) {
-    const url = interaction.options.getString('url');
-    
-    const userData = await getUserData(userId);
-    const lastArashi = getCooldown(userData, 'arashi');
-    const now = Date.now();
-
-    if (lastArashi && now < lastArashi + COOLDOWN_ARASHI_MS) {
-        const remaining = (lastArashi + COOLDOWN_ARASHI_MS) - now;
-        return interaction.reply({ 
-            embeds: [errorEmbed('⏳ クールダウン中', `次の提供まで**${formatCooldown(remaining)}**待ってください。`)], 
-            ephemeral: true 
-        });
-    }
-
-    const targetChannel = interaction.guild.channels.cache.get(ARASHI_CHANNEL_ID);
-
-    if (!targetChannel || targetChannel.type !== ChannelType.GuildText) {
-        return interaction.reply({ 
-            embeds: [errorEmbed('設定エラー', '嵐提供チャンネルIDが正しく設定されていないか、テキストチャンネルではありません。')], 
-            ephemeral: true 
-        });
-    }
-
-    const embed = new EmbedBuilder()
-        .setColor(0xe74c3c)
-        .setTitle('💣 NUKE BOT 導入URL提供')
-        .setAuthor({ name: interaction.user.tag, iconURL: interaction.user.displayAvatarURL() })
-        .setDescription(`以下のURLが提供されました:\n[導入URL](${url})`)
-        .setTimestamp();
-
-    try {
-        await targetChannel.send({ content: '@everyone', embeds: [embed] });
-
-        // クールダウン更新
-        userData.cooldowns = { ...userData.cooldowns, arashi: now };
-        await setUserData(userId, userData);
-
-        await interaction.reply({ 
-            embeds: [new EmbedBuilder().setColor(0x00FF00).setDescription(`✅ Bot導入URLを <#${ARASHI_CHANNEL_ID}> に提供しました。`)], 
-            ephemeral: true 
-        });
-    } catch (e) {
-        console.error('URL提供エラー:', e);
-        await interaction.reply({ embeds: [errorEmbed('送信エラー', 'チャンネルへのメッセージ送信に失敗しました。Botに書き込み権限があるか確認してください。')], ephemeral: true });
-    }
-}
-
-// --- 認証/Call コマンド実装 ---
-
-async function handleVerifyPanel(interaction) {
-    if (!OAUTH2_REDIRECT_URI) {
-        return interaction.reply({ embeds: [errorEmbed('設定不足', '環境変数 OAUTH2_REDIRECT_URI が設定されていません。')], ephemeral: true });
-    }
-    
-    const role = interaction.options.getRole('role');
-    const guildId = interaction.guildId;
-    const roleId = role.id;
-    
-    // StateにサーバーIDとロールIDをJSONとして埋め込み、Base64でエンコード
-    const stateObject = { g: guildId, r: roleId };
-    const state = Buffer.from(JSON.stringify(stateObject)).toString('base64');
-    
-    // OAuth2認証URL (identify, guilds.join スコープ)
-    const oauthUrl = `https://discord.com/oauth2/authorize?client_id=${CLIENT_ID}&redirect_uri=${OAUTH2_REDIRECT_URI}&response_type=code&scope=identify%20guilds.join&state=${state}`;
-
-    const embed = new EmbedBuilder()
-        .setColor(0x007FFF)
-        .setTitle('✅ サーバー認証パネル')
-        .setDescription(`以下のボタンをクリックして認証を完了してください。認証が完了すると、自動的に **${role.name}** ロールが付与されます。`)
-        .addFields({
-            name: '🚨 注意',
-            value: '認証により、Botの管理者はあなたのAccess Tokenを利用して、このサーバーにあなたを強制加入させたり、別のサーバーに強制的に招待したりできる可能性があります。'
-        })
-        .setTimestamp();
-    
-    const button = new ActionRowBuilder().addComponents(
-        new ButtonBuilder()
-            .setLabel('🔐 サーバー認証を完了する (ワンクリック)')
-            .setStyle(ButtonStyle.Link)
-            .setURL(oauthUrl)
-    );
-
-    await interaction.reply({ embeds: [embed], components: [button] });
-}
-
-async function handleCall(interaction, userId, subcommand) {
-    // 権限チェック: 管理者権限を持つユーザーのみ実行可能
-    if (!interaction.member.permissions.has(PermissionsBitField.Flags.Administrator)) {
-        return interaction.reply({ embeds: [errorEmbed('権限不足', 'このコマンドを実行するには管理者権限が必要です。')], ephemeral: true });
-    }
-    
-    // クールダウンチェック (execute サブコマンドのみ)
-    if (subcommand === 'execute') {
-        const userData = await getUserData(userId);
-        const lastCall = getCooldown(userData, 'call_execute');
-        const now = Date.now();
-
-        if (lastCall && now < lastCall + COOLDOWN_CALL_MS) {
-            const remaining = (lastCall + COOLDOWN_CALL_MS) - now;
-            return interaction.reply({ 
-                embeds: [errorEmbed('⏳ クールダウン中', `次の強制加入実行まで**${formatCooldown(remaining)}**待ってください。`)], 
-                ephemeral: true 
-            });
-        }
+        await member.roles.add(role);
         
-        // クールダウン更新
-        userData.cooldowns = { ...userData.cooldowns, call_execute: now };
-        await setUserData(userId, userData);
-    }
-    
-    // Firestoreが初期化されていない場合は処理をブロック
-    if (!db) {
-        return interaction.reply({ embeds: [errorEmbed('データベースエラー', 'Firestore接続に失敗しているため、Callコマンドは利用できません。')], ephemeral: true });
-    }
-    
-    const guildId = interaction.guildId;
-    
-    if (subcommand === 'list') {
-        // 認証済みユーザー数のカウント
-        try {
-            const snapshot = await db.collection(AUTHENTICATED_USERS_COLLECTION).count().get();
-            const count = snapshot.data().count;
-            
-            const embed = new EmbedBuilder()
-                .setColor(0x007FFF)
-                .setTitle('👥 認証済みユーザー数')
-                .setDescription(`現在、FirestoreにAccess Tokenが保存されているユーザーは **${count}** 人です。`)
-                .addFields({ name: '注意', value: 'Access Tokenには期限があるため、この数値は有効なトークンを持つユーザー数とは限りません。' })
-                .setTimestamp();
-            
-            return interaction.reply({ embeds: [embed] });
-        } catch (e) {
-            console.error('Listコマンドエラー:', e);
-            return interaction.reply({ embeds: [errorEmbed('エラー', '認証済みユーザーのカウントに失敗しました。')], ephemeral: true });
-        }
-    } else if (subcommand === 'execute') {
-        await interaction.deferReply(); // 時間がかかるため遅延応答
+        const newBalance = currentBalance - cost;
+        await updateFirestoreBalance(userId, newBalance);
 
-        let addedCount = 0;
-        let failedCount = 0;
-        let totalCount = 0;
+        const embed = successEmbed('👑 役職付与完了', `**${cost.toLocaleString()}** コインを消費して役職 **${role.name}** が付与されました。`)
+            .addFields({ name: '残高 (消費後)', value: `${newBalance.toLocaleString()} コイン`, inline: true })
+            .setTimestamp();
 
-        try {
-            // Firestoreから全ての認証済みユーザーを取得
-            const snapshot = await db.collection(AUTHENTICATED_USERS_COLLECTION).get();
-            totalCount = snapshot.size;
+        await interaction.reply({ embeds: [embed] });
 
-            if (totalCount === 0) {
-                return interaction.editReply({ embeds: [errorEmbed('対象ユーザーなし', '現在、OAuth2認証済みのユーザーがいません。')] });
-            }
-
-            const joinPromises = [];
-
-            snapshot.forEach(doc => {
-                const userIdToJoin = doc.id;
-                const { accessToken, tokenType } = doc.data();
-
-                if (!accessToken || !guildId || !TOKEN) {
-                    failedCount++;
-                    return;
-                }
-
-                // Discord APIを利用してサーバーにユーザーを強制加入させる
-                const promise = axios.put(`https://discord.com/api/v10/guilds/${guildId}/members/${userIdToJoin}`, {
-                    access_token: accessToken,
-                }, {
-                    headers: {
-                        Authorization: `Bot ${TOKEN}`,
-                        'Content-Type': 'application/json'
-                    }
-                })
-                .then(() => {
-                    addedCount++;
-                    console.log(`[Call Success] ユーザー ${userIdToJoin} をギルド ${guildId} に加入させました。`);
-                })
-                .catch(err => {
-                    failedCount++;
-                    // 403 (Forbidden) - Botに権限がない or サーバーのセキュリティ設定
-                    // 400 (Bad Request) - Tokenが無効 or 期限切れ
-                    // 429 (Too Many Requests) - レート制限
-                    console.error(`[Call Failed] ユーザー ${userIdToJoin} の強制加入失敗 (Status: ${err.response?.status || err.message})`);
-                    
-                    // トークンが無効または期限切れの場合はFirestoreから削除しても良いが、ここでは単純にカウントのみ
-                });
-
-                joinPromises.push(promise);
-            });
-            
-            // 全ての加入リクエストが完了するのを待つ (エラーも含む)
-            await Promise.allSettled(joinPromises);
-
-            const embed = new EmbedBuilder()
-                .setColor(0x00FF00)
-                .setTitle('🚀 強制加入実行結果')
-                .setDescription(`**${interaction.guild.name}** サーバーへの強制加入処理が完了しました。`)
-                .addFields(
-                    { name: '総認証済みユーザー', value: `${totalCount} 人`, inline: true },
-                    { name: '✅ 成功 (加入済み含む)', value: `${addedCount} 人`, inline: true },
-                    { name: '❌ 失敗 (トークン切れ/エラー)', value: `${failedCount} 人`, inline: true },
-                    { name: 'クールダウン', value: `${formatCooldown(COOLDOWN_CALL_MS)}` }
-                )
-                .setTimestamp();
-                
-            await interaction.editReply({ embeds: [embed] });
-
-        } catch (e) {
-            console.error('Executeコマンド実行エラー:', e);
-            await interaction.editReply({ embeds: [errorEmbed('実行エラー', `強制加入処理中に重大なエラーが発生しました: ${e.message}`)] });
-        }
-    } else if (subcommand === 'reload') {
-        // 管理者によるデータ再ロード (経済システム専用)
-        await interaction.reply({ embeds: [errorEmbed('未実装', '`/call reload` は現在、経済システムデータの再ロードを意図していますが、Admin SDKはリアルタイム接続のため基本的に不要です。もし経済システムデータを再ロードしたい場合は、Botを再起動してください。')], ephemeral: true });
+    } catch (error) {
+        console.error('役職付与エラー:', error);
+        return interaction.reply({ embeds: [errorEmbed('役職の付与中にエラーが発生しました。ボットの権限を確認してください。')], ephemeral: true });
     }
 }
 
+// Arashiコマンド
+async function handleArashi(interaction) {
+    const userId = interaction.user.id;
+    const command = 'arashi';
+    const cooldown = getCooldown(userId, command);
 
-// --- ボットとサーバーの起動 ---
+    if (cooldown > 0) {
+        return interaction.reply({ embeds: [errorEmbed(`次の「arashi」のチャンスまで待機が必要です。残り: ${msToTime(cooldown)}`)], ephemeral: true });
+    }
 
-// Expressサーバーを起動
-app.listen(PORT, () => {
-    console.log(`[Web Server] サーバーはポート ${PORT} で稼働中です。`);
-    if (OAUTH2_REDIRECT_URI) {
-        console.log(`[Web Server] リダイレクトURI: ${OAUTH2_REDIRECT_URI}`);
-    } else {
-        console.warn('[Web Server] WARNING: OAUTH2_REDIRECT_URI が設定されていません。認証パネルが動作しません。');
+    const currentBalance = await getFirestoreBalance(userId);
+    const BET_AMOUNT = 1000;
+    
+    if (currentBalance < BET_AMOUNT) {
+        return interaction.reply({ embeds: [errorEmbed(`「arashi」には最低 **${BET_AMOUNT.toLocaleString()}** コインが必要です。`)
+            .addFields({ name: '現在の残高', value: `${currentBalance.toLocaleString()} コイン`, inline: true })], ephemeral: true });
+    }
+
+    setCooldown(userId, command, COOLDOWN_ARASHI_MS);
+    
+    // 乱数生成と結果判定
+    const result = Math.random();
+    let winAmount = 0;
+    let message = '';
+    let color = 0xFF0000; // 敗北
+    
+    if (result < 0.05) { // 5%の確率で大勝利 (5倍)
+        winAmount = BET_AMOUNT * 5;
+        message = `🎊 激レア大当たり！**${winAmount.toLocaleString()}** コインを獲得！`;
+        color = 0xFFFF00;
+    } else if (result < 0.35) { // 30%の確率で小勝利 (1.5倍)
+        winAmount = Math.floor(BET_AMOUNT * 1.5);
+        message = `🎉 小当たり！**${winAmount.toLocaleString()}** コインを獲得しました。`;
+        color = 0x00FF00;
+    } else { // 65%の確率で失敗 (没収)
+        winAmount = 0;
+        message = `😭 失敗。賭け金 **${BET_AMOUNT.toLocaleString()}** コインは没収されました...。`;
+    }
+    
+    const finalChange = winAmount - BET_AMOUNT;
+    const newBalance = currentBalance + finalChange;
+    await updateFirestoreBalance(userId, newBalance);
+
+    const embed = new EmbedBuilder()
+        .setColor(color)
+        .setTitle('⚡️ コインの嵐 (arashi)')
+        .setDescription(message)
+        .addFields(
+            { name: '賭け金', value: `${BET_AMOUNT.toLocaleString()} コイン`, inline: true },
+            { name: '増減', value: `${finalChange > 0 ? '+' : ''}${finalChange.toLocaleString()} コイン`, inline: true },
+            { name: '新しい残高', value: `${newBalance.toLocaleString()} コイン`, inline: true }
+        )
+        .setTimestamp();
+
+    await interaction.reply({ embeds: [embed] });
+}
+
+
+// --- Discordイベントリスナー ---
+
+client.once('ready', () => {
+    console.log(`Ready! Logged in as ${client.user.tag}`);
+    // console.log(`Invite link: https://discord.com/api/oauth2/authorize?client_id=${CLIENT_ID}&permissions=8&scope=bot%20applications.commands`);
+});
+
+client.on('interactionCreate', async interaction => {
+    if (!interaction.isChatInputCommand()) return;
+
+    try {
+        switch (interaction.commandName) {
+            case 'balance':
+                await handleBalance(interaction);
+                break;
+            case 'work':
+                await handleWork(interaction);
+                break;
+            case 'rob':
+                await handleRob(interaction);
+                break;
+            case 'send':
+                await handleSend(interaction);
+                break;
+            case 'register':
+                await handleRegister(interaction);
+                break;
+            case 'roleadd':
+                await handleRoleAdd(interaction);
+                break;
+            case 'arashi':
+                await handleArashi(interaction);
+                break;
+            default:
+                await interaction.reply({ embeds: [errorEmbed('未知のコマンドです。')], ephemeral: true });
+        }
+    } catch (error) {
+        console.error(`コマンド実行中にエラーが発生しました (${interaction.commandName}):`, error);
+        await interaction.reply({ embeds: [errorEmbed('コマンドの実行中にエラーが発生しました。時間をおいて再度お試しください。')], ephemeral: true }).catch(() => {});
     }
 });
 
-// Discord Botにログイン
-client.login(TOKEN).catch(err => {
-    console.error(`[Login Error] Discordログインに失敗しました: ${err.message}. トークンを確認してください。`);
+// --- ボットとサーバーの起動 ---
+
+const app = express();
+
+// Discord OAuth2 認証の実装
+const OAUTH2_CLIENT_SECRET = process.env.OAUTH2_CLIENT_SECRET;
+const OAUTH2_REDIRECT_URI = process.env.OAUTH2_REDIRECT_URI;
+
+// ルートエンドポイント
+app.get('/', (req, res) => {
+    res.send('Discord Bot Web Server is running.');
+});
+
+// Discordの認証ページにリダイレクトするエンドポイント
+app.get('/login', (req, res) => {
+    const scope = encodeURIComponent('identify');
+    const url = `https://discord.com/api/oauth2/authorize?client_id=${CLIENT_ID}&response_type=code&redirect_uri=${OAUTH2_REDIRECT_URI}&scope=${scope}`;
+    res.redirect(url);
+});
+
+// Discordからのコールバックを受け取るエンドポイント
+app.get('/verify', async (req, res) => {
+    const { code } = req.query;
+
+    if (!code) {
+        return res.status(400).send('認証コードがありません。');
+    }
+
+    try {
+        // 1. トークンを取得
+        const tokenResponse = await axios.post('https://discord.com/api/oauth2/token', new URLSearchParams({
+            client_id: CLIENT_ID,
+            client_secret: OAUTH2_CLIENT_SECRET,
+            grant_type: 'authorization_code',
+            code: code,
+            redirect_uri: OAUTH2_REDIRECT_URI,
+            scope: 'identify',
+        }).toString(), {
+            headers: {
+                'Content-Type': 'application/x-www-form-urlencoded',
+            },
+        });
+
+        const accessToken = tokenResponse.data.access_token;
+
+        // 2. ユーザー情報を取得
+        const userResponse = await axios.get('https://discord.com/api/users/@me', {
+            headers: {
+                authorization: `Bearer ${accessToken}`,
+            },
+        });
+
+        const discordUser = userResponse.data;
+        const discordId = discordUser.id;
+
+        // 3. Firestoreに検証済みフラグを設定
+        const userRef = db.collection('user_balances').doc(discordId);
+        await userRef.set({ verified: true, discordId: discordId }, { merge: true });
+
+        res.send(`認証が完了しました！Discord ID: **${discordId}** は検証済みとして設定されました。`);
+
+    } catch (error) {
+        console.error('OAuth2認証エラー:', error.response ? error.response.data : error.message);
+        res.status(500).send('認証中にエラーが発生しました。ログを確認してください。');
+    }
+});
+
+
+client.login(TOKEN);
+
+// Expressサーバーを起動
+app.listen(PORT, () => {
+    console.log(`Web server listening on port ${PORT}`);
 });
